@@ -241,12 +241,90 @@ impl SpeakVApp {
     fn save_username(&self) {
         let _ = fs::write("user_config.txt", &self.username);
     }
+
+    fn render_update_section(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(format!("Current Version: {}", self.update_manager.current_version));
+        });
+        
+        ui.add_space(5.0);
+        
+        // Display update status
+        if let Ok(mut status) = self.update_manager.status.lock() {
+            match &*status {
+                UpdateStatus::Idle => {
+                    if ui.button("🔍 Check for Updates").clicked() {
+                        self.update_manager.check_for_updates("RomaniukOleksii", "SpeakV");
+                    }
+                }
+                UpdateStatus::Checking => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Checking for updates...");
+                    });
+                }
+                UpdateStatus::UpdateAvailable(version) => {
+                    ui.label(egui::RichText::new(format!("✨ Update available: v{}", version))
+                        .color(egui::Color32::GREEN)
+                        .strong());
+                    ui.add_space(5.0);
+                    if ui.button("⬇ Download and Install").clicked() {
+                        self.update_manager.download_and_install("RomaniukOleksii", "SpeakV");
+                    }
+                }
+                UpdateStatus::NoUpdateAvailable => {
+                    ui.label(egui::RichText::new("✓ You're up to date!")
+                        .color(egui::Color32::GREEN));
+                    ui.add_space(5.0);
+                    if ui.button("🔄 Check Again").clicked() {
+                        self.update_manager.check_for_updates("RomaniukOleksii", "SpeakV");
+                    }
+                }
+                UpdateStatus::Downloading => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Downloading update...");
+                    });
+                }
+                UpdateStatus::Installing => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Installing update...");
+                    });
+                }
+                UpdateStatus::Success => {
+                    ui.label(egui::RichText::new("✓ Update installed successfully!")
+                        .color(egui::Color32::GREEN)
+                        .strong());
+                    ui.label("Would you like to restart now?");
+                    ui.add_space(5.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("🚀 Restart Now").clicked() {
+                            std::process::exit(0);
+                        }
+                        if ui.button("⏱ Later").clicked() {
+                            *status = UpdateStatus::Idle; // Reset to idle so it goes away
+                        }
+                    });
+                }
+                UpdateStatus::Error(err) => {
+                    ui.label(egui::RichText::new(format!("❌ Error: {}", err))
+                        .color(egui::Color32::RED));
+                    ui.add_space(5.0);
+                    if ui.button("🔄 Try Again").clicked() {
+                        self.update_manager.check_for_updates("RomaniukOleksii", "SpeakV");
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl eframe::App for SpeakVApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Handle incoming network chat messages
         if let Some(net) = &self.network_manager {
+            self.is_connected = *net.is_connected.lock().unwrap();
             while let Ok(packet) = net.chat_rx.try_recv() {
                 if let crate::network::NetworkPacket::ChatMessage { username, message, timestamp } = packet {
                     self.chat_messages.push(ChatMessage {
@@ -367,45 +445,52 @@ impl eframe::App for SpeakVApp {
                         ui.horizontal(|ui| {
                             let btn_text = if self.is_register_mode { "Register" } else { "Login" };
                             if ui.add(egui::Button::new(btn_text).min_size(egui::vec2(100.0, 30.0))).clicked() {
-                                // Connect if not connected
-                                if !self.is_connected {
-                                    if let (Some(net), Some(audio)) = (&mut self.network_manager, &self.audio_manager) {
-                                        let (tx_out, rx_out) = crossbeam_channel::unbounded();
-                                        self.outgoing_chat_tx = tx_out.clone();
-
-                                        net.start(
-                                            self.server_address.clone(),
-                                            audio.input_consumer.clone(),
-                                            audio.remote_producer.clone(),
-                                            rx_out,
-                                            self.login_input.clone(),
-                                        );
-
-                                        // Explicitly wait or send handshake
-                                        let _ = tx_out.send(crate::network::NetworkPacket::Handshake { 
-                                            username: self.login_input.clone() 
-                                        });
-                                    }
-                                }
-
-                                // Send Auth Packet
-                                let packet = if self.is_register_mode {
-                                    crate::network::NetworkPacket::Register { 
-                                        username: self.login_input.clone(), 
-                                        password: self.password_input.clone() 
-                                    }
+                                if self.login_input.trim().is_empty() || self.password_input.trim().is_empty() {
+                                    self.auth_message = "Please enter both username and password".to_string();
                                 } else {
-                                    crate::network::NetworkPacket::Login { 
-                                        username: self.login_input.clone(), 
-                                        password: self.password_input.clone() 
+                                    self.auth_message = "Connecting...".to_string();
+                                    
+                                    // Connect if not connected
+                                    if !self.is_connected {
+                                        if let (Some(net), Some(audio)) = (&mut self.network_manager, &self.audio_manager) {
+                                            let (tx_out, rx_out) = crossbeam_channel::unbounded();
+                                            self.outgoing_chat_tx = tx_out.clone();
+
+                                            net.start(
+                                                self.server_address.clone(),
+                                                audio.input_consumer.clone(),
+                                                audio.remote_producer.clone(),
+                                                rx_out,
+                                                self.login_input.clone(),
+                                            );
+
+                                            // Explicitly send handshake
+                                            let _ = tx_out.send(crate::network::NetworkPacket::Handshake { 
+                                                username: self.login_input.clone() 
+                                            });
+                                        }
                                     }
-                                };
-                                let _ = self.outgoing_chat_tx.send(packet);
+
+                                    // Send Auth Packet
+                                    let packet = if self.is_register_mode {
+                                        crate::network::NetworkPacket::Register { 
+                                            username: self.login_input.clone(), 
+                                            password: self.password_input.clone() 
+                                        }
+                                    } else {
+                                        crate::network::NetworkPacket::Login { 
+                                            username: self.login_input.clone(), 
+                                            password: self.password_input.clone() 
+                                        }
+                                    };
+                                    let _ = self.outgoing_chat_tx.send(packet);
+                                }
                             }
 
                             if ui.button(if self.is_register_mode { "Switch to Login" } else { "Switch to Register" }).clicked() {
                                 self.is_register_mode = !self.is_register_mode;
                                 self.auth_message.clear();
+                                self.password_input.clear();
                             }
                         });
                     });
@@ -413,6 +498,11 @@ impl eframe::App for SpeakVApp {
                     ui.add_space(40.0);
                     ui.label("Server Address:");
                     ui.text_edit_singleline(&mut self.server_address);
+                    
+                    ui.add_space(20.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+                    self.render_update_section(ui);
                 });
             });
             return;
@@ -998,66 +1088,7 @@ impl eframe::App for SpeakVApp {
                     ui.separator();
                     ui.add_space(10.0);
                     
-                    ui.horizontal(|ui| {
-                        ui.label(format!("Current Version: {}", self.update_manager.current_version));
-                    });
-                    
-                    ui.add_space(10.0);
-                    
-                    // Display update status
-                    if let Ok(status) = self.update_manager.status.lock() {
-                        match &*status {
-                            UpdateStatus::Idle => {
-                                if ui.button("🔍 Check for Updates").clicked() {
-                                    // Replace with your GitHub repo details
-                                    self.update_manager.check_for_updates("RomaniukOleksii", "SpeakV");
-                                }
-                            }
-                            UpdateStatus::Checking => {
-                                ui.spinner();
-                                ui.label("Checking for updates...");
-                            }
-                            UpdateStatus::UpdateAvailable(version) => {
-                                ui.label(egui::RichText::new(format!("✨ Update available: v{}", version))
-                                    .color(egui::Color32::GREEN)
-                                    .strong());
-                                ui.add_space(5.0);
-                                if ui.button("⬇ Download and Install").clicked() {
-                                    self.update_manager.download_and_install("RomaniukOleksii", "SpeakV");
-                                }
-                            }
-                            UpdateStatus::NoUpdateAvailable => {
-                                ui.label(egui::RichText::new("✓ You're up to date!")
-                                    .color(egui::Color32::GREEN));
-                                ui.add_space(5.0);
-                                if ui.button("🔄 Check Again").clicked() {
-                                    self.update_manager.check_for_updates("RomaniukOleksii", "SpeakV");
-                                }
-                            }
-                            UpdateStatus::Downloading => {
-                                ui.spinner();
-                                ui.label("Downloading update...");
-                            }
-                            UpdateStatus::Installing => {
-                                ui.spinner();
-                                ui.label("Installing update...");
-                            }
-                            UpdateStatus::Success => {
-                                ui.label(egui::RichText::new("✓ Update installed successfully!")
-                                    .color(egui::Color32::GREEN)
-                                    .strong());
-                                ui.label("Please restart the application.");
-                            }
-                            UpdateStatus::Error(err) => {
-                                ui.label(egui::RichText::new(format!("❌ Error: {}", err))
-                                    .color(egui::Color32::RED));
-                                ui.add_space(5.0);
-                                if ui.button("🔄 Try Again").clicked() {
-                                    self.update_manager.check_for_updates("RomaniukOleksii", "SpeakV");
-                                }
-                            }
-                        }
-                    }
+                    self.render_update_section(ui);
                     
                     ui.add_space(20.0);
                     ui.separator();

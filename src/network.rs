@@ -159,7 +159,7 @@ impl NetworkManager {
                                     }
                                     let _ = speaking_tx.send(username);
                                 }
-                                NetworkPacket::ChatMessage { .. } | NetworkPacket::UsersUpdate(_) | NetworkPacket::TypingStatus { .. } => {
+                                NetworkPacket::ChatMessage { .. } | NetworkPacket::UsersUpdate(_) | NetworkPacket::TypingStatus { .. } | NetworkPacket::AuthResponse { .. } => {
                                     let _ = incoming_chat_tx.send(packet);
                                 }
                                 _ => {}
