@@ -52,6 +52,7 @@ pub async fn run_server() -> anyhow::Result<()> {
         
         if let Ok(packet) = bincode::deserialize::<crate::network::NetworkPacket>(&buf[..len]) {
             let mut clients_guard = clients.lock().await;
+            let mut needs_broadcast = false;
             
             match &packet {
                 crate::network::NetworkPacket::Handshake { username } => {
@@ -60,6 +61,7 @@ pub async fn run_server() -> anyhow::Result<()> {
                         username: username.clone(),
                         last_seen: tokio::time::Instant::now(),
                     });
+                    needs_broadcast = true;
                 }
                 crate::network::NetworkPacket::Audio(_) | crate::network::NetworkPacket::ChatMessage { .. } => {
                     // Update last seen
@@ -79,10 +81,26 @@ pub async fn run_server() -> anyhow::Result<()> {
                         info.last_seen = tokio::time::Instant::now();
                     }
                 }
+                _ => {}
             }
             
             // Clean up old clients (timeout after 10 seconds)
+            let initial_count = clients_guard.len();
             clients_guard.retain(|_, info| info.last_seen.elapsed().as_secs() < 10);
+            if clients_guard.len() != initial_count {
+                needs_broadcast = true;
+            }
+
+            // Broadcast user list if needed
+            if needs_broadcast {
+                let usernames: Vec<String> = clients_guard.values().map(|c| c.username.clone()).collect();
+                let update_packet = crate::network::NetworkPacket::UsersUpdate(usernames);
+                if let Ok(encoded) = bincode::serialize(&update_packet) {
+                    for &client_addr in clients_guard.keys() {
+                        let _ = socket.send_to(&encoded, client_addr).await;
+                    }
+                }
+            }
         }
     }
 }

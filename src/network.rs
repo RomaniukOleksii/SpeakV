@@ -10,6 +10,7 @@ pub enum NetworkPacket {
     Handshake { username: String },
     Audio(Vec<f32>),
     ChatMessage { username: String, message: String, timestamp: String },
+    UsersUpdate(Vec<String>),
     Ping,
 }
 

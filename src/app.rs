@@ -74,6 +74,7 @@ pub struct SpeakVApp {
     chat_input: String,
     show_chat: bool,
     outgoing_chat_tx: crossbeam_channel::Sender<crate::network::NetworkPacket>,
+    participants: Vec<String>,
 }
 
 impl SpeakVApp {
@@ -167,6 +168,7 @@ impl SpeakVApp {
             chat_input: String::new(),
             show_chat: true,
             outgoing_chat_tx: tx_out,
+            participants: Vec::new(),
         };
 
         // Auto-start server and connect
@@ -228,6 +230,8 @@ impl eframe::App for SpeakVApp {
                         message,
                         timestamp,
                     });
+                } else if let crate::network::NetworkPacket::UsersUpdate(users) = packet {
+                    self.participants = users;
                 }
             }
         }
@@ -478,6 +482,27 @@ impl eframe::App for SpeakVApp {
                         });
                     });
                     ui.separator();
+
+                    // Participants list
+                    if !self.participants.is_empty() {
+                        ui.label(egui::RichText::new("👥 Participants").strong());
+                        ui.horizontal_wrapped(|ui| {
+                            for user in &self.participants {
+                                let badge_color = if user == &self.username {
+                                    egui::Color32::from_rgb(0, 150, 255) // Blue for self
+                                } else {
+                                    egui::Color32::from_rgb(80, 80, 80) // Gray for others
+                                };
+                                
+                                ui.label(egui::RichText::new(user)
+                                    .small()
+                                    .color(egui::Color32::WHITE)
+                                    .background_color(badge_color));
+                                ui.add_space(4.0);
+                            }
+                        });
+                        ui.separator();
+                    }
 
                     // Using a layout that places items from the bottom up
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
