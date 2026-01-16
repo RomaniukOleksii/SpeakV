@@ -78,6 +78,8 @@ pub struct SpeakVApp {
     outgoing_chat_tx: crossbeam_channel::Sender<crate::network::NetworkPacket>,
     participants: Vec<String>,
     typing_users: HashMap<String, Instant>,
+    speaking_users: HashMap<String, Instant>,
+    user_volumes: Arc<Mutex<HashMap<String, f32>>>,
     last_typing_sent: Instant,
 }
 
@@ -136,6 +138,8 @@ impl SpeakVApp {
 
         let (tx_out, rx_out) = crossbeam_channel::unbounded();
 
+        let user_volumes = if let Some(net) = &network_manager { net.user_volumes.clone() } else { Arc::new(Mutex::new(HashMap::new())) };
+
         let app = Self {
             audio_manager,
             network_manager,
@@ -147,7 +151,7 @@ impl SpeakVApp {
             is_muted: false,
             is_deafened: false,
             is_away: false,
-
+            
             channels,
             current_channel_index: Some(0),
             push_to_talk_active: false,
@@ -160,7 +164,7 @@ impl SpeakVApp {
             input_mode: InputMode::PushToTalk,
             vad_threshold: 0.05,
             self_listen: false,
-
+            
             show_create_channel_dialog: false,
             new_channel_name: String::new(),
             server_address: "127.0.0.1:9999".to_string(),
@@ -174,6 +178,8 @@ impl SpeakVApp {
             outgoing_chat_tx: tx_out,
             participants: Vec::new(),
             typing_users: HashMap::new(),
+            speaking_users: HashMap::new(),
+            user_volumes,
             last_typing_sent: Instant::now(),
         };
 
@@ -208,7 +214,7 @@ impl SpeakVApp {
                 
                 // Auto connect
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                net_clone.start(addr, input_cons, remote_prod, rx_out);
+                net_clone.start(addr, input_cons, remote_prod, rx_out, username_clone.clone());
 
                 // Send handshake
                 let _ = tx_out_clone.send(crate::network::NetworkPacket::Handshake { 
@@ -250,6 +256,14 @@ impl eframe::App for SpeakVApp {
 
         // Clean up old typing statuses (older than 3 seconds)
         self.typing_users.retain(|_, &mut last_seen| last_seen.elapsed().as_secs_f32() < 3.0);
+        
+        // Handle speaking indicators
+        if let Some(net) = &self.network_manager {
+            while let Ok(username) = net.speaking_users_rx.try_recv() {
+                self.speaking_users.insert(username, Instant::now());
+            }
+        }
+        self.speaking_users.retain(|_, &mut last_seen| last_seen.elapsed().as_secs_f32() < 0.2);
 
         // Login Screen
         if !self.is_logged_in {
@@ -359,6 +373,7 @@ impl eframe::App for SpeakVApp {
                                         audio.input_consumer.clone(),
                                         audio.remote_producer.clone(),
                                         rx_out,
+                                        self.username.clone(),
                                     );
 
                                     // Send handshake
@@ -503,16 +518,41 @@ impl eframe::App for SpeakVApp {
                         ui.label(egui::RichText::new("👥 Participants").strong());
                         ui.horizontal_wrapped(|ui| {
                             for user in &self.participants {
+                                let is_speaking = self.speaking_users.contains_key(user);
+                                
                                 let badge_color = if user == &self.username {
                                     egui::Color32::from_rgb(0, 150, 255) // Blue for self
+                                } else if is_speaking {
+                                    egui::Color32::from_rgb(0, 200, 50) // Green for speaking
                                 } else {
                                     egui::Color32::from_rgb(80, 80, 80) // Gray for others
                                 };
                                 
-                                ui.label(egui::RichText::new(user)
+                                let label = egui::RichText::new(user)
                                     .small()
                                     .color(egui::Color32::WHITE)
-                                    .background_color(badge_color));
+                                    .background_color(badge_color);
+                                
+                                let resp = ui.label(label);
+                                
+                                // Context menu for volume
+                                resp.context_menu(|ui| {
+                                    ui.heading(format!("Settings for {}", user));
+                                    if user != &self.username {
+                                        let mut volumes = self.user_volumes.lock().unwrap();
+                                        let vol = volumes.entry(user.clone()).or_insert(1.0);
+                                        ui.horizontal(|ui| {
+                                            ui.label("Volume:");
+                                            ui.add(egui::Slider::new(vol, 0.0..=2.0).text("x"));
+                                        });
+                                        if ui.button("Reset").clicked() {
+                                            *vol = 1.0;
+                                        }
+                                    } else {
+                                        ui.label("This is you!");
+                                    }
+                                });
+
                                 ui.add_space(4.0);
                             }
                         });

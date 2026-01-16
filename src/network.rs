@@ -8,7 +8,7 @@ use serde::{Serialize, Deserialize};
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum NetworkPacket {
     Handshake { username: String },
-    Audio(Vec<f32>),
+    Audio { username: String, data: Vec<f32> },
     ChatMessage { username: String, message: String, timestamp: String },
     UsersUpdate(Vec<String>),
     TypingStatus { username: String, is_typing: bool },
@@ -26,11 +26,15 @@ pub struct NetworkManager {
     runtime: tokio::runtime::Handle,
     pub chat_tx: crossbeam_channel::Sender<NetworkPacket>,
     pub chat_rx: crossbeam_channel::Receiver<NetworkPacket>,
+    pub user_volumes: Arc<Mutex<std::collections::HashMap<String, f32>>>,
+    pub speaking_users_tx: crossbeam_channel::Sender<String>,
+    pub speaking_users_rx: crossbeam_channel::Receiver<String>,
 }
 
 impl NetworkManager {
     pub fn new() -> Result<Self> {
         let (tx, rx) = crossbeam_channel::unbounded();
+        let (s_tx, s_rx) = crossbeam_channel::unbounded();
         Ok(Self {
             is_running: Arc::new(Mutex::new(false)),
             is_connected: Arc::new(Mutex::new(false)),
@@ -38,6 +42,9 @@ impl NetworkManager {
             runtime: tokio::runtime::Handle::current(),
             chat_tx: tx,
             chat_rx: rx,
+            user_volumes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            speaking_users_tx: s_tx,
+            speaking_users_rx: s_rx,
         })
     }
 
@@ -47,11 +54,14 @@ impl NetworkManager {
         input_consumer: Arc<Mutex<LocalConsumer>>,
         remote_producer: Arc<Mutex<LocalProducer>>,
         outgoing_chat_rx: crossbeam_channel::Receiver<NetworkPacket>,
+        username: String,
     ) {
         let is_running = self.is_running.clone();
         let is_connected = self.is_connected.clone();
         let can_transmit = self.can_transmit.clone();
         let incoming_chat_tx = self.chat_tx.clone();
+        let user_volumes = self.user_volumes.clone();
+        let speaking_tx = self.speaking_users_tx.clone();
         
         self.runtime.spawn(async move {
             let addr: SocketAddr = match addr_str.parse() {
@@ -111,7 +121,10 @@ impl NetworkManager {
                 }
 
                 if has_audio {
-                    let packet = NetworkPacket::Audio(input_buf.clone());
+                    let packet = NetworkPacket::Audio {
+                        username: username.clone(),
+                        data: input_buf.clone(),
+                    };
                     if let Ok(encoded) = bincode::serialize(&packet) {
                         let _ = socket.send(&encoded).await;
                     }
@@ -122,13 +135,26 @@ impl NetworkManager {
                     Ok(len) = socket.recv(&mut receive_buf) => {
                         if let Ok(packet) = bincode::deserialize::<NetworkPacket>(&receive_buf[..len]) {
                             match packet {
-                                NetworkPacket::Audio(samples) => {
+                                NetworkPacket::Audio { username, mut data } => {
+                                    // Apply per-user volume
+                                    let volume = {
+                                        let volumes = user_volumes.lock().unwrap();
+                                        *volumes.get(&username).unwrap_or(&1.0)
+                                    };
+                                    
+                                    if volume != 1.0 {
+                                        for x in &mut data {
+                                            *x *= volume;
+                                        }
+                                    }
+
                                     let mut prod = remote_producer.lock().unwrap();
-                                    for &sample in &samples {
+                                    for &sample in &data {
                                         let _ = prod.try_push(sample);
                                     }
+                                    let _ = speaking_tx.send(username);
                                 }
-                                NetworkPacket::ChatMessage { .. } => {
+                                NetworkPacket::ChatMessage { .. } | NetworkPacket::UsersUpdate(_) | NetworkPacket::TypingStatus { .. } => {
                                     let _ = incoming_chat_tx.send(packet);
                                 }
                                 _ => {}

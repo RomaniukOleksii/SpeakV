@@ -63,7 +63,7 @@ pub async fn run_server() -> anyhow::Result<()> {
                     });
                     needs_broadcast = true;
                 }
-                crate::network::NetworkPacket::Audio(_) | 
+                crate::network::NetworkPacket::Audio { .. } | 
                 crate::network::NetworkPacket::ChatMessage { .. } |
                 crate::network::NetworkPacket::TypingStatus { .. } => {
                     // Update last seen
