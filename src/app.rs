@@ -2,8 +2,10 @@ use eframe::egui;
 use crate::audio::AudioManager;
 use crate::network::NetworkManager;
 use crate::updater::{UpdateManager, UpdateStatus};
+use std::collections::HashMap;
 use std::fs;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 struct User {
     name: String,
@@ -75,6 +77,8 @@ pub struct SpeakVApp {
     show_chat: bool,
     outgoing_chat_tx: crossbeam_channel::Sender<crate::network::NetworkPacket>,
     participants: Vec<String>,
+    typing_users: HashMap<String, Instant>,
+    last_typing_sent: Instant,
 }
 
 impl SpeakVApp {
@@ -169,6 +173,8 @@ impl SpeakVApp {
             show_chat: true,
             outgoing_chat_tx: tx_out,
             participants: Vec::new(),
+            typing_users: HashMap::new(),
+            last_typing_sent: Instant::now(),
         };
 
         // Auto-start server and connect
@@ -232,9 +238,18 @@ impl eframe::App for SpeakVApp {
                     });
                 } else if let crate::network::NetworkPacket::UsersUpdate(users) = packet {
                     self.participants = users;
+                } else if let crate::network::NetworkPacket::TypingStatus { username, is_typing } = packet {
+                    if is_typing {
+                        self.typing_users.insert(username, Instant::now());
+                    } else {
+                        self.typing_users.remove(&username);
+                    }
                 }
             }
         }
+
+        // Clean up old typing statuses (older than 3 seconds)
+        self.typing_users.retain(|_, &mut last_seen| last_seen.elapsed().as_secs_f32() < 3.0);
 
         // Login Screen
         if !self.is_logged_in {
@@ -516,6 +531,17 @@ impl eframe::App for SpeakVApp {
                                     .desired_width(ui.available_width() - 60.0)
                             );
                             
+                            // Send typing status if changed and enough time passed (0.5s)
+                            if response.changed() {
+                                if self.last_typing_sent.elapsed().as_secs_f32() > 0.5 {
+                                    let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::TypingStatus {
+                                        username: self.username.clone(),
+                                        is_typing: !self.chat_input.trim().is_empty(),
+                                    });
+                                    self.last_typing_sent = Instant::now();
+                                }
+                            }
+
                             let send_clicked = ui.button("Send").clicked();
                             
                             if (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) || send_clicked {
@@ -536,11 +562,30 @@ impl eframe::App for SpeakVApp {
                                         timestamp: msg.timestamp.clone(),
                                     });
 
+                                    // Clear typing status
+                                    let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::TypingStatus {
+                                        username: self.username.clone(),
+                                        is_typing: false,
+                                    });
+
                                     self.chat_messages.push(msg);
                                     self.chat_input.clear();
                                 }
                             }
                         });
+                        
+                        // Typing status indicators
+                        if !self.typing_users.is_empty() {
+                            let typing_names: Vec<String> = self.typing_users.keys().cloned().collect();
+                            let text = if typing_names.len() == 1 {
+                                format!("{} is typing...", typing_names[0])
+                            } else if typing_names.len() < 4 {
+                                format!("{} are typing...", typing_names.join(", "))
+                            } else {
+                                "Multiple users are typing...".to_string()
+                            };
+                            ui.label(egui::RichText::new(text).small().italics().color(egui::Color32::GRAY));
+                        }
                         
                         ui.separator();
                         

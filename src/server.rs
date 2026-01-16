@@ -63,7 +63,9 @@ pub async fn run_server() -> anyhow::Result<()> {
                     });
                     needs_broadcast = true;
                 }
-                crate::network::NetworkPacket::Audio(_) | crate::network::NetworkPacket::ChatMessage { .. } => {
+                crate::network::NetworkPacket::Audio(_) | 
+                crate::network::NetworkPacket::ChatMessage { .. } |
+                crate::network::NetworkPacket::TypingStatus { .. } => {
                     // Update last seen
                     if let Some(info) = clients_guard.get_mut(&addr) {
                         info.last_seen = tokio::time::Instant::now();

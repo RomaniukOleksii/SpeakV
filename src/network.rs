@@ -11,6 +11,7 @@ pub enum NetworkPacket {
     Audio(Vec<f32>),
     ChatMessage { username: String, message: String, timestamp: String },
     UsersUpdate(Vec<String>),
+    TypingStatus { username: String, is_typing: bool },
     Ping,
 }
 
