@@ -10,8 +10,13 @@ pub enum NetworkPacket {
     Handshake { username: String },
     Audio { username: String, data: Vec<f32> },
     ChatMessage { username: String, message: String, timestamp: String },
-    UsersUpdate(Vec<String>),
+    UsersUpdate(Vec<(String, Vec<String>)>), // Vec<(ChannelName, Vec<Username>)>
+    JoinChannel(String),
+    CreateChannel(String),
     TypingStatus { username: String, is_typing: bool },
+    Register { username: String, password: String },
+    Login { username: String, password: String },
+    AuthResponse { success: bool, message: String },
     Ping,
 }
 

@@ -34,6 +34,12 @@ struct ChatMessage {
     timestamp: String,
 }
 
+#[derive(PartialEq)]
+enum ChatTab {
+    Chat,
+    Users,
+}
+
 pub struct SpeakVApp {
     audio_manager: Option<AudioManager>,
     network_manager: Option<NetworkManager>,
@@ -41,7 +47,10 @@ pub struct SpeakVApp {
     
     // State
     username: String,
-    is_logged_in: bool,
+    password_input: String,
+    is_authenticated: bool,
+    is_register_mode: bool,
+    auth_message: String,
     login_input: String,
 
     // Local User State
@@ -81,6 +90,7 @@ pub struct SpeakVApp {
     speaking_users: HashMap<String, Instant>,
     user_volumes: Arc<Mutex<HashMap<String, f32>>>,
     last_typing_sent: Instant,
+    active_chat_tab: ChatTab,
 }
 
 impl SpeakVApp {
@@ -103,12 +113,10 @@ impl SpeakVApp {
 
         // Load Username
         let mut username = String::new();
-        let mut is_logged_in = false;
         if let Ok(saved_name) = fs::read_to_string("user_config.txt") {
             let saved_name = saved_name.trim();
             if !saved_name.is_empty() {
                 username = saved_name.to_string();
-                is_logged_in = true;
             }
         }
 
@@ -145,8 +153,11 @@ impl SpeakVApp {
             network_manager,
             update_manager: UpdateManager::new(),
             username: username.clone(),
-            is_logged_in,
             login_input: username,
+            password_input: String::new(),
+            is_authenticated: false,
+            is_register_mode: false,
+            auth_message: String::new(),
             
             is_muted: false,
             is_deafened: false,
@@ -181,6 +192,7 @@ impl SpeakVApp {
             speaking_users: HashMap::new(),
             user_volumes,
             last_typing_sent: Instant::now(),
+            active_chat_tab: ChatTab::Chat,
         };
 
         // Auto-start server and connect
@@ -242,8 +254,62 @@ impl eframe::App for SpeakVApp {
                         message,
                         timestamp,
                     });
-                } else if let crate::network::NetworkPacket::UsersUpdate(users) = packet {
-                    self.participants = users;
+                } else if let crate::network::NetworkPacket::AuthResponse { success, message } = packet {
+                    self.is_authenticated = success;
+                    self.auth_message = message;
+                    if success {
+                        self.username = self.login_input.clone();
+                        self.save_username();
+                    }
+                } else if let crate::network::NetworkPacket::UsersUpdate(chan_state) = packet {
+                    // Update participants (flat list)
+                    self.participants.clear();
+                    for (_chan_name, users) in &chan_state {
+                        for user in users {
+                            if !self.participants.contains(user) {
+                                self.participants.push(user.clone());
+                            }
+                        }
+                    }
+
+                    // Rebuild channels list while preserving expansion state
+                    let mut new_channels = Vec::new();
+                    for (chan_name, users) in chan_state {
+                        let expanded = self.channels.iter()
+                            .find(|c| c.name == chan_name)
+                            .map(|c| c.expanded)
+                            .unwrap_or(true);
+                        
+                        let mut user_list = Vec::new();
+                        for user_name in users {
+                            user_list.push(User {
+                                name: user_name.clone(),
+                                is_speaking: self.speaking_users.contains_key(&user_name),
+                                is_muted: false, // These will be handled by per-user volume/context menu
+                                is_deafened: false,
+                                is_away: false,
+                            });
+                        }
+
+                        new_channels.push(Channel {
+                            name: chan_name,
+                            users: user_list,
+                            expanded,
+                        });
+                    }
+                    self.channels = new_channels;
+
+                    // Update current channel index
+                    if let Some(_net) = &self.network_manager {
+                        // We don't have a direct "current channel" from server in hand yet, 
+                        // but we can find where the current user is.
+                        for (idx, chan) in self.channels.iter().enumerate() {
+                            if chan.users.iter().any(|u| u.name == self.username) {
+                                self.current_channel_index = Some(idx);
+                                break;
+                            }
+                        }
+                    }
                 } else if let crate::network::NetworkPacket::TypingStatus { username, is_typing } = packet {
                     if is_typing {
                         self.typing_users.insert(username, Instant::now());
@@ -265,30 +331,88 @@ impl eframe::App for SpeakVApp {
         }
         self.speaking_users.retain(|_, &mut last_seen| last_seen.elapsed().as_secs_f32() < 0.2);
 
-        // Login Screen
-        if !self.is_logged_in {
+        // Auth Screen
+        if !self.is_authenticated {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(150.0);
-                    ui.heading(egui::RichText::new("Welcome to SpeakV").size(32.0).strong().color(egui::Color32::from_rgb(0, 255, 128)));
-                    ui.add_space(30.0);
+                    ui.add_space(100.0);
+                    ui.heading(egui::RichText::new("SpeakV").size(40.0).strong().color(egui::Color32::from_rgb(0, 255, 128)));
+                    ui.label(egui::RichText::new("Secure Communication").size(16.0).color(egui::Color32::GRAY));
+                    ui.add_space(40.0);
                     
-                    ui.label("Enter your username:");
-                    ui.add_space(5.0);
-                    
-                    let response = ui.add(egui::TextEdit::singleline(&mut self.login_input).hint_text("Username").desired_width(200.0));
-                    
-                    ui.add_space(20.0);
-                    
-                    let login_btn = egui::Button::new("Login").min_size(egui::vec2(100.0, 30.0));
-                    if ui.add(login_btn).clicked() || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
-                        let trimmed = self.login_input.trim();
-                        if !trimmed.is_empty() {
-                            self.username = trimmed.to_string();
-                            self.is_logged_in = true;
-                            self.save_username();
+                    let frame = egui::Frame::group(ui.style())
+                        .fill(egui::Color32::from_rgb(40, 40, 45))
+                        .rounding(8.0)
+                        .inner_margin(20.0);
+
+                    frame.show(ui, |ui| {
+                        ui.set_width(300.0);
+                        ui.heading(if self.is_register_mode { "Register" } else { "Login" });
+                        ui.add_space(10.0);
+
+                        ui.label("Username:");
+                        ui.text_edit_singleline(&mut self.login_input);
+                        ui.add_space(10.0);
+
+                        ui.label("Password:");
+                        ui.add(egui::TextEdit::singleline(&mut self.password_input).password(true));
+                        ui.add_space(20.0);
+
+                        if !self.auth_message.is_empty() {
+                            let color = if self.is_authenticated { egui::Color32::GREEN } else { egui::Color32::LIGHT_RED };
+                            ui.label(egui::RichText::new(&self.auth_message).color(color));
+                            ui.add_space(10.0);
                         }
-                    }
+
+                        ui.horizontal(|ui| {
+                            let btn_text = if self.is_register_mode { "Register" } else { "Login" };
+                            if ui.add(egui::Button::new(btn_text).min_size(egui::vec2(100.0, 30.0))).clicked() {
+                                // Connect if not connected
+                                if !self.is_connected {
+                                    if let (Some(net), Some(audio)) = (&mut self.network_manager, &self.audio_manager) {
+                                        let (tx_out, rx_out) = crossbeam_channel::unbounded();
+                                        self.outgoing_chat_tx = tx_out.clone();
+
+                                        net.start(
+                                            self.server_address.clone(),
+                                            audio.input_consumer.clone(),
+                                            audio.remote_producer.clone(),
+                                            rx_out,
+                                            self.login_input.clone(),
+                                        );
+
+                                        // Explicitly wait or send handshake
+                                        let _ = tx_out.send(crate::network::NetworkPacket::Handshake { 
+                                            username: self.login_input.clone() 
+                                        });
+                                    }
+                                }
+
+                                // Send Auth Packet
+                                let packet = if self.is_register_mode {
+                                    crate::network::NetworkPacket::Register { 
+                                        username: self.login_input.clone(), 
+                                        password: self.password_input.clone() 
+                                    }
+                                } else {
+                                    crate::network::NetworkPacket::Login { 
+                                        username: self.login_input.clone(), 
+                                        password: self.password_input.clone() 
+                                    }
+                                };
+                                let _ = self.outgoing_chat_tx.send(packet);
+                            }
+
+                            if ui.button(if self.is_register_mode { "Switch to Login" } else { "Switch to Register" }).clicked() {
+                                self.is_register_mode = !self.is_register_mode;
+                                self.auth_message.clear();
+                            }
+                        });
+                    });
+
+                    ui.add_space(40.0);
+                    ui.label("Server Address:");
+                    ui.text_edit_singleline(&mut self.server_address);
                 });
             });
             return;
@@ -417,7 +541,7 @@ impl eframe::App for SpeakVApp {
                 ui.separator();
                 
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    let mut channel_to_join = None;
+                    let channel_to_join = None;
 
                     for (idx, channel) in self.channels.iter_mut().enumerate() {
                         ui.push_id(idx, |ui| {
@@ -437,7 +561,9 @@ impl eframe::App for SpeakVApp {
                                 };
                                 
                                 if ui.selectable_label(is_current, label_text).clicked() {
-                                    channel_to_join = Some(idx);
+                                    if let Some(_net) = &self.network_manager {
+                                        let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::JoinChannel(channel.name.clone()));
+                                    }
                                 }
 
                                 for user in &channel.users {
@@ -502,9 +628,13 @@ impl eframe::App for SpeakVApp {
                 .resizable(true)
                 .default_width(300.0)
                 .show(ctx, |ui| {
-                    ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        ui.heading(egui::RichText::new("💬 Chat").color(egui::Color32::WHITE));
+                        if ui.selectable_label(self.active_chat_tab == ChatTab::Chat, "💬 Chat").clicked() {
+                            self.active_chat_tab = ChatTab::Chat;
+                        }
+                        if ui.selectable_label(self.active_chat_tab == ChatTab::Users, "👥 Users").clicked() {
+                            self.active_chat_tab = ChatTab::Users;
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("✖").clicked() {
                                 self.show_chat = false;
@@ -513,143 +643,141 @@ impl eframe::App for SpeakVApp {
                     });
                     ui.separator();
 
-                    // Participants list
-                    if !self.participants.is_empty() {
-                        ui.label(egui::RichText::new("👥 Participants").strong());
-                        ui.horizontal_wrapped(|ui| {
-                            for user in &self.participants {
-                                let is_speaking = self.speaking_users.contains_key(user);
-                                
-                                let badge_color = if user == &self.username {
-                                    egui::Color32::from_rgb(0, 150, 255) // Blue for self
-                                } else if is_speaking {
-                                    egui::Color32::from_rgb(0, 200, 50) // Green for speaking
-                                } else {
-                                    egui::Color32::from_rgb(80, 80, 80) // Gray for others
-                                };
-                                
-                                let label = egui::RichText::new(user)
-                                    .small()
-                                    .color(egui::Color32::WHITE)
-                                    .background_color(badge_color);
-                                
-                                let resp = ui.label(label);
-                                
-                                // Context menu for volume
-                                resp.context_menu(|ui| {
-                                    ui.heading(format!("Settings for {}", user));
-                                    if user != &self.username {
-                                        let mut volumes = self.user_volumes.lock().unwrap();
-                                        let vol = volumes.entry(user.clone()).or_insert(1.0);
-                                        ui.horizontal(|ui| {
-                                            ui.label("Volume:");
-                                            ui.add(egui::Slider::new(vol, 0.0..=2.0).text("x"));
-                                        });
-                                        if ui.button("Reset").clicked() {
-                                            *vol = 1.0;
-                                        }
-                                    } else {
-                                        ui.label("This is you!");
-                                    }
-                                });
-
-                                ui.add_space(4.0);
-                            }
-                        });
-                        ui.separator();
-                    }
-
-                    // Using a layout that places items from the bottom up
-                    ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                        ui.add_space(10.0);
-                        
-                        // Chat input area at the very bottom
-                        ui.horizontal(|ui| {
-                            let response = ui.add(
-                                egui::TextEdit::singleline(&mut self.chat_input)
-                                    .hint_text("Type a message...")
-                                    .desired_width(ui.available_width() - 60.0)
-                            );
-                            
-                            // Send typing status if changed and enough time passed (0.5s)
-                            if response.changed() {
-                                if self.last_typing_sent.elapsed().as_secs_f32() > 0.5 {
-                                    let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::TypingStatus {
-                                        username: self.username.clone(),
-                                        is_typing: !self.chat_input.trim().is_empty(),
-                                    });
-                                    self.last_typing_sent = Instant::now();
-                                }
-                            }
-
-                            let send_clicked = ui.button("Send").clicked();
-                            
-                            if (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) || send_clicked {
-                                if !self.chat_input.trim().is_empty() {
-                                    let now = chrono::Local::now();
-                                    let timestamp = now.format("%H:%M").to_string();
+                    if self.active_chat_tab == ChatTab::Users {
+                        // Participants list tab
+                        ui.label(egui::RichText::new("👥 Connected Participants").strong());
+                        ui.add_space(4.0);
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            ui.vertical(|ui| {
+                                for user in &self.participants {
+                                    let is_speaking = self.speaking_users.contains_key(user);
                                     
-                                    let msg = ChatMessage {
-                                        username: self.username.clone(),
-                                        message: self.chat_input.clone(),
-                                        timestamp,
+                                    let badge_color = if user == &self.username {
+                                        egui::Color32::from_rgb(0, 150, 255) // Blue for self
+                                    } else if is_speaking {
+                                        egui::Color32::from_rgb(0, 200, 50) // Green for speaking
+                                    } else {
+                                        egui::Color32::from_rgb(80, 80, 80) // Gray for others
                                     };
                                     
-                                    // Send over network
-                                    let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::ChatMessage {
-                                        username: msg.username.clone(),
-                                        message: msg.message.clone(),
-                                        timestamp: msg.timestamp.clone(),
-                                    });
-
-                                    // Clear typing status
-                                    let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::TypingStatus {
-                                        username: self.username.clone(),
-                                        is_typing: false,
-                                    });
-
-                                    self.chat_messages.push(msg);
-                                    self.chat_input.clear();
-                                }
-                            }
-                        });
-                        
-                        // Typing status indicators
-                        if !self.typing_users.is_empty() {
-                            let typing_names: Vec<String> = self.typing_users.keys().cloned().collect();
-                            let text = if typing_names.len() == 1 {
-                                format!("{} is typing...", typing_names[0])
-                            } else if typing_names.len() < 4 {
-                                format!("{} are typing...", typing_names.join(", "))
-                            } else {
-                                "Multiple users are typing...".to_string()
-                            };
-                            ui.label(egui::RichText::new(text).small().italics().color(egui::Color32::GRAY));
-                        }
-                        
-                        ui.separator();
-                        
-                        // Remaining space is for the scroll area (now at the top of the bottom_up stack)
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .stick_to_bottom(true)
-                            .show(ui, |ui| {
-                                ui.vertical(|ui| {
-                                    for msg in &self.chat_messages {
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.label(egui::RichText::new(&msg.timestamp)
-                                                .size(10.0)
-                                                .color(egui::Color32::GRAY));
-                                            ui.label(egui::RichText::new(format!("{}:", msg.username))
-                                                .strong()
-                                                .color(egui::Color32::from_rgb(100, 200, 255)));
+                                    ui.horizontal(|ui| {
+                                        let (rect, _resp) = ui.allocate_at_least(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                                        ui.painter().circle_filled(rect.center(), 5.0, badge_color);
+                                        
+                                        let label = egui::RichText::new(user)
+                                            .color(egui::Color32::WHITE);
+                                        
+                                        let resp = ui.label(label);
+                                        
+                                        // Context menu for volume
+                                        resp.context_menu(|ui| {
+                                            ui.heading(format!("Settings for {}", user));
+                                            if user != &self.username {
+                                                let mut volumes = self.user_volumes.lock().unwrap();
+                                                let vol = volumes.entry(user.clone()).or_insert(1.0);
+                                                ui.horizontal(|ui| {
+                                                    ui.label("Volume:");
+                                                    ui.add(egui::Slider::new(vol, 0.0..=2.0).text("x"));
+                                                });
+                                                if ui.button("Reset").clicked() {
+                                                    *vol = 1.0;
+                                                }
+                                            } else {
+                                                ui.label("This is you!");
+                                            }
                                         });
-                                        ui.label(&msg.message);
-                                        ui.add_space(8.0);
-                                    }
-                                });
+                                    });
+                                    ui.add_space(4.0);
+                                }
                             });
-                    });
+                        });
+                    } else {
+                        // Chat tab
+                        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                            ui.add_space(10.0);
+                            
+                            // Chat input area
+                            ui.horizontal(|ui| {
+                                let response = ui.add(
+                                    egui::TextEdit::singleline(&mut self.chat_input)
+                                        .hint_text("Type a message...")
+                                        .desired_width(ui.available_width() - 60.0)
+                                );
+                                
+                                if response.changed() {
+                                    if self.last_typing_sent.elapsed().as_secs_f32() > 0.5 {
+                                        let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::TypingStatus {
+                                            username: self.username.clone(),
+                                            is_typing: !self.chat_input.trim().is_empty(),
+                                        });
+                                        self.last_typing_sent = Instant::now();
+                                    }
+                                }
+
+                                let send_clicked = ui.button("Send").clicked();
+                                if (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) || send_clicked {
+                                    if !self.chat_input.trim().is_empty() {
+                                        let timestamp = chrono::Local::now().format("%H:%M").to_string();
+                                        let msg = ChatMessage {
+                                            username: self.username.clone(),
+                                            message: self.chat_input.clone(),
+                                            timestamp,
+                                        };
+                                        
+                                        let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::ChatMessage {
+                                            username: msg.username.clone(),
+                                            message: msg.message.clone(),
+                                            timestamp: msg.timestamp.clone(),
+                                        });
+
+                                        let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::TypingStatus {
+                                            username: self.username.clone(),
+                                            is_typing: false,
+                                        });
+
+                                        self.chat_messages.push(msg);
+                                        self.chat_input.clear();
+                                    }
+                                }
+                            });
+                            
+                            // Typing indicators
+                            if !self.typing_users.is_empty() {
+                                let typing_names: Vec<String> = self.typing_users.keys().cloned().collect();
+                                let text = if typing_names.len() == 1 {
+                                    format!("{} is typing...", typing_names[0])
+                                } else if typing_names.len() < 4 {
+                                    format!("{} are typing...", typing_names.join(", "))
+                                } else {
+                                    "Multiple users are typing...".to_string()
+                                };
+                                ui.label(egui::RichText::new(text).small().italics().color(egui::Color32::GRAY));
+                            }
+                            
+                            ui.separator();
+                            
+                            // Message history
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .stick_to_bottom(true)
+                                .show(ui, |ui| {
+                                    ui.vertical(|ui| {
+                                        for msg in &self.chat_messages {
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.label(egui::RichText::new(&msg.timestamp)
+                                                    .size(10.0)
+                                                    .color(egui::Color32::GRAY));
+                                                ui.label(egui::RichText::new(format!("{}:", msg.username))
+                                                    .strong()
+                                                    .color(egui::Color32::from_rgb(100, 200, 255)));
+                                            });
+                                            ui.label(&msg.message);
+                                            ui.add_space(8.0);
+                                        }
+                                    });
+                                });
+                        });
+                    }
                 });
         } else {
             // Show chat button when chat is hidden
@@ -954,11 +1082,9 @@ impl eframe::App for SpeakVApp {
                     ui.horizontal(|ui| {
                         if ui.button("Create").clicked() {
                             if !self.new_channel_name.is_empty() {
-                                self.channels.push(Channel {
-                                    name: self.new_channel_name.clone(),
-                                    users: vec![],
-                                    expanded: true,
-                                });
+                                if let Some(_net) = &self.network_manager {
+                                    let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::CreateChannel(self.new_channel_name.clone()));
+                                }
                                 self.new_channel_name.clear();
                                 self.show_create_channel_dialog = false;
                             }
