@@ -73,6 +73,7 @@ pub struct SpeakVApp {
     chat_messages: Vec<ChatMessage>,
     chat_input: String,
     show_chat: bool,
+    outgoing_chat_tx: crossbeam_channel::Sender<crate::network::NetworkPacket>,
 }
 
 impl SpeakVApp {
@@ -128,6 +129,8 @@ impl SpeakVApp {
             },
         ];
 
+        let (tx_out, rx_out) = crossbeam_channel::unbounded();
+
         let app = Self {
             audio_manager,
             network_manager,
@@ -163,6 +166,7 @@ impl SpeakVApp {
             chat_messages: Vec::new(),
             chat_input: String::new(),
             show_chat: true,
+            outgoing_chat_tx: tx_out,
         };
 
         // Auto-start server and connect
@@ -173,6 +177,8 @@ impl SpeakVApp {
             let addr = app.server_address.clone();
             let is_host_clone = app.is_host.clone();
             let public_ip_clone = app.public_ip.clone();
+            let tx_out_clone = app.outgoing_chat_tx.clone();
+            let username_clone = app.username.clone();
 
             tokio::spawn(async move {
                 // Try to be the host
@@ -194,7 +200,12 @@ impl SpeakVApp {
                 
                 // Auto connect
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                net_clone.start(addr, input_cons, remote_prod);
+                net_clone.start(addr, input_cons, remote_prod, rx_out);
+
+                // Send handshake
+                let _ = tx_out_clone.send(crate::network::NetworkPacket::Handshake { 
+                    username: username_clone 
+                });
             });
         }
 
@@ -208,6 +219,19 @@ impl SpeakVApp {
 
 impl eframe::App for SpeakVApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Handle incoming network chat messages
+        if let Some(net) = &self.network_manager {
+            while let Ok(packet) = net.chat_rx.try_recv() {
+                if let crate::network::NetworkPacket::ChatMessage { username, message, timestamp } = packet {
+                    self.chat_messages.push(ChatMessage {
+                        username,
+                        message,
+                        timestamp,
+                    });
+                }
+            }
+        }
+
         // Login Screen
         if !self.is_logged_in {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -308,11 +332,20 @@ impl eframe::App for SpeakVApp {
                                 }
                             } else {
                                 if let (Some(net), Some(audio)) = (&mut self.network_manager, &self.audio_manager) {
+                                    let (tx_out, rx_out) = crossbeam_channel::unbounded();
+                                    self.outgoing_chat_tx = tx_out.clone();
+
                                     net.start(
                                         self.server_address.clone(),
                                         audio.input_consumer.clone(),
                                         audio.remote_producer.clone(),
+                                        rx_out,
                                     );
+
+                                    // Send handshake
+                                    let _ = tx_out.send(crate::network::NetworkPacket::Handshake { 
+                                        username: self.username.clone() 
+                                    });
                                 }
                             }
                         }
@@ -471,6 +504,13 @@ impl eframe::App for SpeakVApp {
                                         timestamp,
                                     };
                                     
+                                    // Send over network
+                                    let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::ChatMessage {
+                                        username: msg.username.clone(),
+                                        message: msg.message.clone(),
+                                        timestamp: msg.timestamp.clone(),
+                                    });
+
                                     self.chat_messages.push(msg);
                                     self.chat_input.clear();
                                 }

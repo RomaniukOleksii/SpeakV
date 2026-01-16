@@ -39,23 +39,50 @@ pub async fn run_server() -> anyhow::Result<()> {
     
     println!("SpeakV Server started on 0.0.0.0:9999");
 
-    let clients: Arc<Mutex<HashMap<SocketAddr, tokio::time::Instant>>> = Arc::new(Mutex::new(HashMap::new()));
-    let mut buf = [0u8; 2048];
+    struct ClientInfo {
+        username: String,
+        last_seen: tokio::time::Instant,
+    }
+
+    let clients: Arc<Mutex<HashMap<SocketAddr, ClientInfo>>> = Arc::new(Mutex::new(HashMap::new()));
+    let mut buf = [0u8; 4096];
 
     loop {
         let (len, addr) = socket.recv_from(&mut buf).await?;
         
-        let mut clients_guard = clients.lock().await;
-        clients_guard.insert(addr, tokio::time::Instant::now());
+        if let Ok(packet) = bincode::deserialize::<crate::network::NetworkPacket>(&buf[..len]) {
+            let mut clients_guard = clients.lock().await;
+            
+            match &packet {
+                crate::network::NetworkPacket::Handshake { username } => {
+                    println!("Server: {} connected from {}", username, addr);
+                    clients_guard.insert(addr, ClientInfo {
+                        username: username.clone(),
+                        last_seen: tokio::time::Instant::now(),
+                    });
+                }
+                crate::network::NetworkPacket::Audio(_) | crate::network::NetworkPacket::ChatMessage { .. } => {
+                    // Update last seen
+                    if let Some(info) = clients_guard.get_mut(&addr) {
+                        info.last_seen = tokio::time::Instant::now();
+                    }
 
-        // Relay to all other clients
-        for (&client_addr, _) in clients_guard.iter() {
-            if client_addr != addr {
-                let _ = socket.send_to(&buf[..len], client_addr).await;
+                    // Relay to all other clients
+                    for (&client_addr, _) in clients_guard.iter() {
+                        if client_addr != addr {
+                            let _ = socket.send_to(&buf[..len], client_addr).await;
+                        }
+                    }
+                }
+                crate::network::NetworkPacket::Ping => {
+                    if let Some(info) = clients_guard.get_mut(&addr) {
+                        info.last_seen = tokio::time::Instant::now();
+                    }
+                }
             }
+            
+            // Clean up old clients (timeout after 10 seconds)
+            clients_guard.retain(|_, info| info.last_seen.elapsed().as_secs() < 10);
         }
-        
-        // Clean up old clients (timeout after 5 seconds)
-        clients_guard.retain(|_, last_seen| last_seen.elapsed().as_secs() < 5);
     }
 }
