@@ -445,56 +445,60 @@ impl eframe::App for SpeakVApp {
                         });
                     });
                     ui.separator();
-                    
-                    // Chat messages area
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            for msg in &self.chat_messages {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label(egui::RichText::new(&msg.timestamp)
-                                        .size(10.0)
-                                        .color(egui::Color32::GRAY));
-                                    ui.label(egui::RichText::new(format!("{}:", msg.username))
-                                        .strong()
-                                        .color(egui::Color32::from_rgb(100, 200, 255)));
-                                });
-                                ui.label(&msg.message);
-                                ui.add_space(8.0);
+
+                    // Using a layout that places items from the bottom up
+                    ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                        ui.add_space(10.0);
+                        
+                        // Chat input area at the very bottom
+                        ui.horizontal(|ui| {
+                            let response = ui.add(
+                                egui::TextEdit::singleline(&mut self.chat_input)
+                                    .hint_text("Type a message...")
+                                    .desired_width(ui.available_width() - 60.0)
+                            );
+                            
+                            let send_clicked = ui.button("Send").clicked();
+                            
+                            if (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) || send_clicked {
+                                if !self.chat_input.trim().is_empty() {
+                                    let now = chrono::Local::now();
+                                    let timestamp = now.format("%H:%M").to_string();
+                                    
+                                    let msg = ChatMessage {
+                                        username: self.username.clone(),
+                                        message: self.chat_input.clone(),
+                                        timestamp,
+                                    };
+                                    
+                                    self.chat_messages.push(msg);
+                                    self.chat_input.clear();
+                                }
                             }
                         });
-                    
-                    ui.separator();
-                    
-                    // Chat input area
-                    ui.horizontal(|ui| {
-                        let response = ui.add(
-                            egui::TextEdit::singleline(&mut self.chat_input)
-                                .hint_text("Type a message...")
-                                .desired_width(ui.available_width() - 60.0)
-                        );
                         
-                        let send_clicked = ui.button("Send").clicked();
+                        ui.separator();
                         
-                        if (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) || send_clicked {
-                            if !self.chat_input.trim().is_empty() {
-                                // Get current time
-                                let now = chrono::Local::now();
-                                let timestamp = now.format("%H:%M").to_string();
-                                
-                                let msg = ChatMessage {
-                                    username: self.username.clone(),
-                                    message: self.chat_input.clone(),
-                                    timestamp,
-                                };
-                                
-                                self.chat_messages.push(msg);
-                                self.chat_input.clear();
-                                
-                                // TODO: Send message over network
-                            }
-                        }
+                        // Remaining space is for the scroll area (now at the top of the bottom_up stack)
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                ui.vertical(|ui| {
+                                    for msg in &self.chat_messages {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(egui::RichText::new(&msg.timestamp)
+                                                .size(10.0)
+                                                .color(egui::Color32::GRAY));
+                                            ui.label(egui::RichText::new(format!("{}:", msg.username))
+                                                .strong()
+                                                .color(egui::Color32::from_rgb(100, 200, 255)));
+                                        });
+                                        ui.label(&msg.message);
+                                        ui.add_space(8.0);
+                                    }
+                                });
+                            });
                     });
                 });
         } else {
