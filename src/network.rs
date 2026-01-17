@@ -105,6 +105,7 @@ impl NetworkManager {
         mut outgoing_chat_rx: tokio::sync::mpsc::UnboundedReceiver<NetworkPacket>,
         incoming_chat_tx: tokio::sync::mpsc::UnboundedSender<NetworkPacket>,
         speaking_users_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        ctx: egui::Context,
         username: String,
     ) {
         let is_running = self.is_running.clone();
@@ -149,6 +150,7 @@ impl NetworkManager {
             let mut receive_buf = vec![0u8; 4096]; // Increased buffer for packets
 
             let mut audio_interval = tokio::time::interval(tokio::time::Duration::from_millis(10));
+            let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
 
             loop {
                 if !*is_running.lock().unwrap() {
@@ -196,44 +198,62 @@ impl NetworkManager {
                         }
                     }
 
-                    // 3. Receive Packets
+                    // 3. Handle Heartbeat (Ping)
+                    _ = ping_interval.tick() => {
+                        let packet = NetworkPacket::Ping;
+                        if let Ok(encoded) = bincode::serialize(&packet) {
+                            let _ = socket.send(&encoded).await;
+                        }
+                    }
+
+                    // 4. Receive Packets
                     res = socket.recv(&mut receive_buf) => {
-                        if let Ok(len) = res {
-                            if let Ok(packet) = bincode::deserialize::<NetworkPacket>(&receive_buf[..len]) {
-                                match packet {
-                                    NetworkPacket::Audio { username, data } => {
-                                        if let Some(decrypted_bytes) = decrypt_bytes(&data) {
-                                            let mut decrypted_data = Vec::new();
-                                            for chunk in decrypted_bytes.chunks_exact(4) {
-                                                let mut bytes = [0u8; 4];
-                                                bytes.copy_from_slice(chunk);
-                                                decrypted_data.push(f32::from_le_bytes(bytes));
-                                            }
+                        match res {
+                            Ok(len) => {
+                                if let Ok(packet) = bincode::deserialize::<NetworkPacket>(&receive_buf[..len]) {
+                                    // Wake up GUI
+                                    ctx.request_repaint();
 
-                                            // Apply per-user volume
-                                            let volume = {
-                                                let volumes = user_volumes.lock().unwrap();
-                                                *volumes.get(&username).unwrap_or(&1.0)
-                                            };
-                                            
-                                            if volume != 1.0 {
-                                                for x in &mut decrypted_data {
-                                                    *x *= volume;
+                                    match packet {
+                                        NetworkPacket::Audio { username, data } => {
+                                            if let Some(decrypted_bytes) = decrypt_bytes(&data) {
+                                                let mut decrypted_data = Vec::new();
+                                                for chunk in decrypted_bytes.chunks_exact(4) {
+                                                    let mut bytes = [0u8; 4];
+                                                    bytes.copy_from_slice(chunk);
+                                                    decrypted_data.push(f32::from_le_bytes(bytes));
                                                 }
-                                            }
 
-                                            let mut prod = remote_producer.lock().unwrap();
-                                            for &sample in &decrypted_data {
-                                                let _ = prod.try_push(sample);
+                                                // Apply per-user volume
+                                                let volume = {
+                                                    let volumes = user_volumes.lock().unwrap();
+                                                    *volumes.get(&username).unwrap_or(&1.0)
+                                                };
+                                                
+                                                if volume != 1.0 {
+                                                    for x in &mut decrypted_data {
+                                                        *x *= volume;
+                                                    }
+                                                }
+
+                                                let mut prod = remote_producer.lock().unwrap();
+                                                for &sample in &decrypted_data {
+                                                    let _ = prod.try_push(sample);
+                                                }
+                                                let _ = speaking_tx.send(username);
                                             }
-                                            let _ = speaking_tx.send(username);
                                         }
+                                        NetworkPacket::ChatMessage { .. } | NetworkPacket::UsersUpdate(_) | NetworkPacket::TypingStatus { .. } | NetworkPacket::AuthResponse { .. } | NetworkPacket::ChatHistory(_) => {
+                                            let _ = incoming_chat_tx.send(packet);
+                                        }
+                                        _ => {}
                                     }
-                                    NetworkPacket::ChatMessage { .. } | NetworkPacket::UsersUpdate(_) | NetworkPacket::TypingStatus { .. } | NetworkPacket::AuthResponse { .. } | NetworkPacket::ChatHistory(_) => {
-                                        let _ = incoming_chat_tx.send(packet);
-                                    }
-                                    _ => {}
                                 }
+                            }
+                            Err(e) => {
+                                // Prevent tight loop on persistent errors (e.g. ICMP Port Unreachable on Windows)
+                                eprintln!("Network: Receive error: {}. Sleeping 100ms...", e);
+                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                             }
                         }
                     }

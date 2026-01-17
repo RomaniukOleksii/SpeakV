@@ -217,6 +217,7 @@ impl SpeakVApp {
             let addr = app.server_address.clone();
             let outgoing_tx = app.outgoing_chat_tx.clone();
             let username_clone = app.username.clone();
+            let ctx_clone = cc.egui_ctx.clone();
             
             // Channel ends for network task
             let network_out_rx = outgoing_chat_rx;
@@ -224,7 +225,7 @@ impl SpeakVApp {
             let network_speaking_tx = speaking_users_tx;
 
             tokio::spawn(async move {
-                net_clone.start(addr, input_cons, remote_prod, network_out_rx, network_in_tx, network_speaking_tx, username_clone.clone());
+                net_clone.start(addr, input_cons, remote_prod, network_out_rx, network_in_tx, network_speaking_tx, ctx_clone, username_clone.clone());
 
                 // Send handshake
                 let _ = outgoing_tx.send(crate::network::NetworkPacket::Handshake { 
@@ -544,6 +545,7 @@ impl eframe::App for SpeakVApp {
                                                 rx_out,
                                                 tx_in,
                                                 tx_sp,
+                                                ctx.clone(),
                                                 self.login_input.clone(),
                                             );
 
@@ -677,6 +679,7 @@ impl eframe::App for SpeakVApp {
                                         rx_out,
                                         tx_in,
                                         tx_sp,
+                                        ctx.clone(),
                                         self.username.clone(),
                                     );
 

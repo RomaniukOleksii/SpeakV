@@ -381,7 +381,7 @@ pub async fn run_server() -> anyhow::Result<()> {
             
             // Clean up old clients (timeout after 10 seconds)
             let initial_count = clients_guard.len();
-            clients_guard.retain(|_, info| info.last_seen.elapsed().as_secs() < 10);
+            clients_guard.retain(|_, info| info.last_seen.elapsed().as_secs() < 30);
             if clients_guard.len() != initial_count {
                 needs_broadcast = true;
             }

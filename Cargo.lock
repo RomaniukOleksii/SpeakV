@@ -4398,7 +4398,7 @@ dependencies = [
 
 [[package]]
 name = "speakv"
-version = "0.6.6"
+version = "0.6.7"
 dependencies = [
  "aead",
  "aes-gcm",
