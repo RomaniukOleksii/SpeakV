@@ -681,8 +681,14 @@ impl eframe::App for SpeakVApp {
             .resizable(true)
             .default_width(250.0)
             .show(ctx, |ui| {
-                ui.add_space(10.0);
-                ui.heading(egui::RichText::new("Server Tree").color(egui::Color32::WHITE));
+                ui.horizontal(|ui| {
+                    ui.heading(egui::RichText::new("Server Tree").color(egui::Color32::WHITE));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("➕").on_hover_text("Create New Channel").clicked() {
+                            self.show_create_channel_dialog = true;
+                        }
+                    });
+                });
                 ui.separator();
                 
                 egui::ScrollArea::vertical().show(ui, |ui| {

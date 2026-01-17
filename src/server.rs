@@ -77,12 +77,34 @@ pub async fn run_server() -> anyhow::Result<()> {
         )",
         [],
     )?;
+    db_conn.execute(
+        "CREATE TABLE IF NOT EXISTS channels (
+            name TEXT PRIMARY KEY NOT NULL
+        )",
+        [],
+    )?;
+    
+    // Default channels
+    let _ = db_conn.execute("INSERT OR IGNORE INTO channels (name) VALUES ('Lobby')", []);
+    let _ = db_conn.execute("INSERT OR IGNORE INTO channels (name) VALUES ('AFK')", []);
+
     let db = Arc::new(StdMutex::new(db_conn));
 
+    let mut initial_channels = std::collections::HashSet::new();
+    {
+        let db_lock = db.lock().unwrap();
+        let mut stmt = db_lock.prepare("SELECT name FROM channels").unwrap();
+        let chan_rows = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
+        for chan in chan_rows {
+            if let Ok(c) = chan {
+                initial_channels.insert(c);
+            }
+        }
+    }
+
     let clients: Arc<Mutex<HashMap<SocketAddr, ClientInfo>>> = Arc::new(Mutex::new(HashMap::new()));
-    let channels: Arc<Mutex<std::collections::HashSet<String>>> = Arc::new(Mutex::new(
-        std::collections::HashSet::from(["Lobby".to_string(), "AFK".to_string()])
-    ));
+    let channels: Arc<Mutex<std::collections::HashSet<String>>> = Arc::new(Mutex::new(initial_channels));
+
     let mut buf = [0u8; 4096];
 
     loop {
@@ -325,6 +347,11 @@ pub async fn run_server() -> anyhow::Result<()> {
                             let mut chan_guard = channels.lock().await;
                             if !chan_guard.contains(name) {
                                 chan_guard.insert(name.clone());
+                                // Save to DB
+                                {
+                                    let db_lock = db.lock().unwrap();
+                                    let _ = db_lock.execute("INSERT OR IGNORE INTO channels (name) VALUES (?1)", params![name]);
+                                }
                                 println!("Server: Channel '{}' created by {}", name, addr);
                                 needs_broadcast = true;
                             }
