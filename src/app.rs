@@ -720,24 +720,44 @@ impl eframe::App for SpeakVApp {
 
                                 for user in &channel.users {
                                     ui.horizontal(|ui| {
+                                        let is_me = user.name == self.username;
                                         let mut icon = "👤";
                                         let mut color = egui::Color32::LIGHT_GRAY;
                                         
-                                        if user.is_away {
-                                            icon = "🌙";
-                                            color = egui::Color32::from_rgb(100, 100, 255);
-                                        } else if user.is_deafened {
-                                            icon = "🙉";
-                                            color = egui::Color32::RED;
-                                        } else if user.is_muted {
-                                            icon = "🔇";
-                                            color = egui::Color32::RED;
-                                        } else if user.is_speaking {
-                                            icon = "🔵";
-                                            color = egui::Color32::from_rgb(100, 200, 255);
+                                        if is_me {
+                                            if self.is_away {
+                                                icon = "🌙";
+                                                color = egui::Color32::from_rgb(100, 100, 255);
+                                            } else if self.is_deafened {
+                                                icon = "🙉";
+                                                color = egui::Color32::RED;
+                                            } else if self.is_muted {
+                                                icon = "🔇";
+                                                color = egui::Color32::RED;
+                                            } else if self.push_to_talk_active {
+                                                icon = "🟢";
+                                                color = egui::Color32::GREEN;
+                                            } else {
+                                                color = egui::Color32::WHITE;
+                                            }
+                                        } else {
+                                            if user.is_away {
+                                                icon = "🌙";
+                                                color = egui::Color32::from_rgb(100, 100, 255);
+                                            } else if user.is_deafened {
+                                                icon = "🙉";
+                                                color = egui::Color32::RED;
+                                            } else if user.is_muted {
+                                                icon = "🔇";
+                                                color = egui::Color32::RED;
+                                            } else if user.is_speaking {
+                                                icon = "🔵";
+                                                color = egui::Color32::from_rgb(100, 200, 255);
+                                            }
                                         }
 
-                                        let mut label = egui::RichText::new(format!("{} {}", icon, user.name)).color(color);
+                                        let display_name = if is_me { format!("{} (You)", user.name) } else { user.name.clone() };
+                                        let mut label = egui::RichText::new(format!("{} {}", icon, display_name)).color(color);
                                         
                                         // Apply nick color
                                         if let Ok(c) = hex_to_color(&user.nick_color) {
@@ -795,28 +815,6 @@ impl eframe::App for SpeakVApp {
                                     });
                                 }
                                 
-                                if is_current {
-                                    ui.horizontal(|ui| {
-                                        let mut icon = "👤";
-                                        let mut color = egui::Color32::WHITE;
-                                        
-                                        if self.is_away {
-                                            icon = "🌙";
-                                            color = egui::Color32::from_rgb(100, 100, 255);
-                                        } else if self.is_deafened {
-                                            icon = "🙉";
-                                            color = egui::Color32::RED;
-                                        } else if self.is_muted {
-                                            icon = "🔇";
-                                            color = egui::Color32::RED;
-                                        } else if self.push_to_talk_active {
-                                            icon = "🟢";
-                                            color = egui::Color32::GREEN;
-                                        }
-                                        
-                                        ui.label(egui::RichText::new(format!("{} {} (You)", icon, self.username)).color(color).strong());
-                                    });
-                                }
                             });
                         });
                         ui.add_space(4.0);
