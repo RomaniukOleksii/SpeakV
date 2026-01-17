@@ -127,6 +127,7 @@ pub async fn run_server() -> anyhow::Result<()> {
                         status: String::new(),
                         nick_color: "#FFFFFF".to_string(),
                     });
+                    needs_broadcast = true;
                 }
                 crate::network::NetworkPacket::Register { username, password } => {
                     let result = {

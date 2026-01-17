@@ -129,28 +129,7 @@ impl SpeakVApp {
         }
 
         // Channels
-        let channels = vec![
-            Channel {
-                name: "Lobby".to_owned(),
-                users: vec![],
-                expanded: true,
-            },
-            Channel {
-                name: "Gaming Room 1".to_owned(),
-                users: vec![],
-                expanded: true,
-            },
-            Channel {
-                name: "Meeting Room".to_owned(),
-                users: vec![],
-                expanded: true,
-            },
-            Channel {
-                name: "AFK".to_owned(),
-                users: vec![],
-                expanded: false,
-            },
-        ];
+        let channels = Vec::new(); // Will be populated by server
 
         let (outgoing_chat_tx, outgoing_chat_rx) = tokio::sync::mpsc::unbounded_channel();
         let (incoming_chat_tx, incoming_chat_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -361,20 +340,6 @@ impl eframe::App for SpeakVApp {
                     if username != self.username {
                         play_notification_beep();
                     }
-                } else if let crate::network::NetworkPacket::ChatHistory(history) = packet {
-                    for p in history {
-                        if let crate::network::NetworkPacket::ChatMessage { username, message, timestamp } = p {
-                            let decrypted_msg = crate::network::decrypt_bytes(&message)
-                                .and_then(|b| String::from_utf8(b).ok())
-                                .unwrap_or_else(|| "[Decryption Failed]".to_string());
-
-                            self.chat_messages.push(ChatMessage {
-                                username,
-                                message: decrypted_msg,
-                                timestamp,
-                            });
-                        }
-                    }
                 } else if let crate::network::NetworkPacket::AuthResponse { success, message, role, status, nick_color } = packet {
                     self.is_authenticated = success;
                     self.auth_message = message;
@@ -390,10 +355,6 @@ impl eframe::App for SpeakVApp {
                             self.nick_color_input = c;
                         }
                         self.save_username();
-                        // Request initial history for Lobby
-                        let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::RequestChatHistory { 
-                            channel: "Lobby".to_string() 
-                        });
                     }
                 } else if let crate::network::NetworkPacket::UsersUpdate(chan_state) = packet {
                     // Update participants (flat list)
@@ -457,11 +418,9 @@ impl eframe::App for SpeakVApp {
                         self.typing_users.remove(&username);
                     }
                 } else if let crate::network::NetworkPacket::ChatHistory(history) = packet {
-                    // Handled in the chat_rx loop above but keeping this if needed for other tabs
-                    // Wait, let's just make it consistent.
-                    self.chat_messages.clear();
-                    for msg_packet in history {
-                        if let crate::network::NetworkPacket::ChatMessage { username, message, timestamp } = msg_packet {
+                    self.chat_messages.clear(); // Clear existing messages before adding history
+                    for p in history {
+                        if let crate::network::NetworkPacket::ChatMessage { username, message, timestamp } = p {
                             let decrypted_msg = crate::network::decrypt_bytes(&message)
                                 .and_then(|b| String::from_utf8(b).ok())
                                 .unwrap_or_else(|| "[Decryption Failed]".to_string());
@@ -703,7 +662,6 @@ impl eframe::App for SpeakVApp {
                     ui.label(egui::RichText::new(format!("Logged in as: {}", self.username)).color(egui::Color32::LIGHT_GRAY));
                 });
             });
-            ui.add_space(8.0);
         });
 
         // Left Panel: Channel Tree
@@ -743,6 +701,7 @@ impl eframe::App for SpeakVApp {
                                 
                                 if ui.selectable_label(is_current, label_text).clicked() {
                                     if let Some(_net) = &self.network_manager {
+                                        self.chat_messages.clear(); // Clear old messages immediately
                                         let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::JoinChannel(channel.name.clone()));
                                         let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::RequestChatHistory { channel: channel.name.clone() });
                                     }
