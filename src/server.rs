@@ -47,6 +47,10 @@ pub async fn run_server() -> anyhow::Result<()> {
         current_channel: String,
         last_seen: tokio::time::Instant,
         is_authenticated: bool,
+        role: String, // "Admin", "User"
+        is_muted: bool,
+        status: String,
+        nick_color: String,
     }
 
     // Initialize Database
@@ -55,7 +59,21 @@ pub async fn run_server() -> anyhow::Result<()> {
         "CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY,
             username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL
+            password_hash TEXT NOT NULL,
+            role TEXT DEFAULT 'User',
+            is_banned INTEGER DEFAULT 0,
+            status TEXT DEFAULT '',
+            nick_color TEXT DEFAULT '#FFFFFF'
+        )",
+        [],
+    )?;
+    db_conn.execute(
+        "CREATE TABLE IF NOT EXISTS chat_messages (
+            id INTEGER PRIMARY KEY,
+            username TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            message BLOB NOT NULL,
+            timestamp TEXT NOT NULL
         )",
         [],
     )?;
@@ -82,15 +100,24 @@ pub async fn run_server() -> anyhow::Result<()> {
                         current_channel: "Lobby".to_string(),
                         last_seen: tokio::time::Instant::now(),
                         is_authenticated: false,
+                        role: "User".to_string(),
+                        is_muted: false,
+                        status: String::new(),
+                        nick_color: "#FFFFFF".to_string(),
                     });
                 }
                 crate::network::NetworkPacket::Register { username, password } => {
                     let result = {
                         let hashed_pass = hash(password, DEFAULT_COST).unwrap_or_else(|_| String::new());
                         let db_lock = db.lock().unwrap();
+                        
+                        // Check if any users exist to assign Admin role to the first one
+                        let user_count: i64 = db_lock.query_row("SELECT count(*) FROM users", [], |row| row.get(0)).unwrap_or(0);
+                        let role = if user_count == 0 { "Admin" } else { "User" };
+
                         db_lock.execute(
-                            "INSERT INTO users (username, password_hash) VALUES (?1, ?2)",
-                            params![username, hashed_pass],
+                            "INSERT INTO users (username, password_hash, role) VALUES (?1, ?2, ?3)",
+                            params![username, hashed_pass, role],
                         )
                     };
                     
@@ -99,58 +126,195 @@ pub async fn run_server() -> anyhow::Result<()> {
                         Err(e) => (false, format!("Registration failed: {}", e)),
                     };
 
-                    let response = crate::network::NetworkPacket::AuthResponse { success, message: msg };
+                    let response = crate::network::NetworkPacket::AuthResponse { 
+                        success, 
+                        message: msg, 
+                        role: None,
+                        status: None,
+                        nick_color: None,
+                    };
                     if let Ok(encoded) = bincode::serialize(&response) {
                         let _ = socket.send_to(&encoded, addr).await;
                     }
                 }
                 crate::network::NetworkPacket::Login { username, password } => {
-                    let result: Result<String, _> = {
+                    let result: Result<(String, String, bool, String, String), _> = {
                         let db_lock = db.lock().unwrap();
-                        let mut stmt = db_lock.prepare("SELECT password_hash FROM users WHERE username = ?1").unwrap();
-                        stmt.query_row(params![username], |row| row.get(0))
+                        let mut stmt = db_lock.prepare("SELECT password_hash, role, is_banned, status, nick_color FROM users WHERE username = ?1").unwrap();
+                        stmt.query_row(params![username], |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i32>(2)? != 0, row.get(3)?, row.get(4)?)))
                     };
 
-                    let (success, msg) = match result {
-                        Ok(stored_hash) => {
-                            if verify(password, &stored_hash).unwrap_or(false) {
-                                (true, "Login successful!".to_string())
+                    let (success, msg, role, status, color) = match result {
+                        Ok((stored_hash, role, is_banned, status, color)) => {
+                            if is_banned {
+                                (false, "You are banned from this server".to_string(), role, status, color)
+                            } else if verify(password, &stored_hash).unwrap_or(false) {
+                                (true, "Login successful!".to_string(), role, status, color)
                             } else {
-                                (false, "Invalid password".to_string())
+                                (false, "Invalid password".to_string(), role, status, color)
                             }
                         }
-                        Err(_) => (false, "User not found".to_string()),
+                        Err(_) => (false, "User not found".to_string(), "User".to_string(), String::new(), "#FFFFFF".to_string()),
                     };
 
                     if success {
                         if let Some(info) = clients_guard.get_mut(&addr) {
                             info.username = username.clone();
                             info.is_authenticated = true;
+                            info.role = role.clone();
+                            info.status = status.clone();
+                            info.nick_color = color.clone();
                             info.last_seen = tokio::time::Instant::now();
-                            println!("Server: {} authenticated via Login", username);
+                            println!("Server: {} authenticated via Login as {}", username, info.role);
                             needs_broadcast = true;
                         }
                     }
 
-                    let response = crate::network::NetworkPacket::AuthResponse { success, message: msg };
+                    let response = crate::network::NetworkPacket::AuthResponse { 
+                        success, 
+                        message: msg, 
+                        role: if success { Some(role) } else { None },
+                        status: if success { Some(status) } else { None },
+                        nick_color: if success { Some(color) } else { None },
+                    };
                     if let Ok(encoded) = bincode::serialize(&response) {
                         let _ = socket.send_to(&encoded, addr).await;
                     }
                 }
+                crate::network::NetworkPacket::UpdateProfile { status, nick_color } => {
+                    if let Some(info) = clients_guard.get_mut(&addr) {
+                        if info.is_authenticated {
+                            info.status = status.clone();
+                            info.nick_color = nick_color.clone();
+                            
+                            // Save to DB
+                            {
+                                let db_lock = db.lock().unwrap();
+                                let _ = db_lock.execute(
+                                    "UPDATE users SET status = ?1, nick_color = ?2 WHERE username = ?3",
+                                    params![status, nick_color, info.username],
+                                );
+                            }
+                            println!("Server: Profile updated for {}", info.username);
+                            needs_broadcast = true;
+                        }
+                    }
+                }
                 crate::network::NetworkPacket::Audio { .. } | 
-                crate::network::NetworkPacket::ChatMessage { .. } |
                 crate::network::NetworkPacket::TypingStatus { .. } => {
-                    let (sender_channel, authenticated) = if let Some(info) = clients_guard.get_mut(&addr) {
+                    let (sender_channel, authenticated, is_muted) = if let Some(info) = clients_guard.get_mut(&addr) {
                         info.last_seen = tokio::time::Instant::now();
-                        (info.current_channel.clone(), info.is_authenticated)
+                        (info.current_channel.clone(), info.is_authenticated, info.is_muted)
                     } else {
-                        ("Lobby".to_string(), false)
+                        ("Lobby".to_string(), false, false)
                     };
 
-                    if authenticated {
+                    if authenticated && !is_muted {
                         for (&client_addr, info) in clients_guard.iter() {
                             if client_addr != addr && info.current_channel == sender_channel && info.is_authenticated {
                                 let _ = socket.send_to(&buf[..len], client_addr).await;
+                            }
+                        }
+                    }
+                }
+                crate::network::NetworkPacket::ChatMessage { username, message, timestamp } => {
+                    let (sender_channel, authenticated, is_muted) = if let Some(info) = clients_guard.get_mut(&addr) {
+                        info.last_seen = tokio::time::Instant::now();
+                        (info.current_channel.clone(), info.is_authenticated, info.is_muted)
+                    } else {
+                        ("Lobby".to_string(), false, false)
+                    };
+
+                    if authenticated && !is_muted {
+                        // Store in DB
+                        {
+                            let db_lock = db.lock().unwrap();
+                            let _ = db_lock.execute(
+                                "INSERT INTO chat_messages (username, channel, message, timestamp) VALUES (?1, ?2, ?3, ?4)",
+                                params![username, sender_channel, message, timestamp],
+                            );
+                        }
+
+                        // Relay to others in the same channel
+                        for (&client_addr, info) in clients_guard.iter() {
+                            if client_addr != addr && info.current_channel == sender_channel && info.is_authenticated {
+                                let _ = socket.send_to(&buf[..len], client_addr).await;
+                            }
+                        }
+                    }
+                }
+                crate::network::NetworkPacket::AdminAction { target, action } => {
+                    let mut admin_name = String::new();
+                    let is_admin = if let Some(info) = clients_guard.get(&addr) {
+                        admin_name = info.username.clone();
+                        info.role == "Admin"
+                    } else {
+                        false
+                    };
+
+                    if is_admin {
+                        match action {
+                            crate::network::AdminActionType::Kick => {
+                                clients_guard.retain(|_, v| &v.username != target);
+                                println!("Admin Action: {} kicked {}", admin_name, target);
+                                needs_broadcast = true;
+                            }
+                            crate::network::AdminActionType::Ban => {
+                                {
+                                    let db_lock = db.lock().unwrap();
+                                    let _ = db_lock.execute("UPDATE users SET is_banned = 1 WHERE username = ?1", params![target]);
+                                }
+                                clients_guard.retain(|_, v| &v.username != target);
+                                println!("Admin Action: {} banned {}", admin_name, target);
+                                needs_broadcast = true;
+                            }
+                            crate::network::AdminActionType::Mute => {
+                                for info in clients_guard.values_mut() {
+                                    if &info.username == target {
+                                        info.is_muted = true;
+                                    }
+                                }
+                                println!("Admin Action: {} muted {}", admin_name, target);
+                                needs_broadcast = true;
+                            }
+                            crate::network::AdminActionType::Unmute => {
+                                for info in clients_guard.values_mut() {
+                                    if &info.username == target {
+                                        info.is_muted = false;
+                                    }
+                                }
+                                println!("Admin Action: {} unmuted {}", admin_name, target);
+                                needs_broadcast = true;
+                            }
+                        }
+                    }
+                }
+                crate::network::NetworkPacket::RequestChatHistory { channel } => {
+                    if let Some(info) = clients_guard.get(&addr) {
+                        if info.is_authenticated {
+                            let history: Vec<crate::network::NetworkPacket> = {
+                                let db_lock = db.lock().unwrap();
+                                let mut stmt = db_lock.prepare(
+                                    "SELECT username, message, timestamp FROM chat_messages 
+                                     WHERE channel = ?1 ORDER BY id DESC LIMIT 50"
+                                ).unwrap();
+                                
+                                let rows = stmt.query_map(params![channel], |row| {
+                                    Ok(crate::network::NetworkPacket::ChatMessage {
+                                        username: row.get(0)?,
+                                        message: row.get::<_, Vec<u8>>(1)?,
+                                        timestamp: row.get(2)?,
+                                    })
+                                }).unwrap();
+
+                                let mut msgs: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+                                msgs.reverse(); // Newest last for display
+                                msgs
+                            };
+
+                            let response = crate::network::NetworkPacket::ChatHistory(history);
+                            if let Ok(encoded) = bincode::serialize(&response) {
+                                let _ = socket.send_to(&encoded, addr).await;
                             }
                         }
                     }
@@ -197,14 +361,20 @@ pub async fn run_server() -> anyhow::Result<()> {
 
             // Broadcast channel/user state if needed
             if needs_broadcast {
-                let mut state: Vec<(String, Vec<String>)> = Vec::new();
+                let mut state: Vec<(String, Vec<crate::network::UserInfo>)> = Vec::new();
                 let chan_guard = channels.lock().await;
                 
                 for chan in chan_guard.iter() {
                     let mut users_in_chan = Vec::new();
                     for client in clients_guard.values() {
                         if &client.current_channel == chan && client.is_authenticated {
-                            users_in_chan.push(client.username.clone());
+                            users_in_chan.push(crate::network::UserInfo {
+                                username: client.username.clone(),
+                                role: client.role.clone(),
+                                is_muted: client.is_muted,
+                                status: client.status.clone(),
+                                nick_color: client.nick_color.clone(),
+                            });
                         }
                     }
                     state.push((chan.clone(), users_in_chan));

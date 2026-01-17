@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use rodio::Source;
 
 struct User {
     name: String,
@@ -13,6 +14,9 @@ struct User {
     is_muted: bool,
     is_deafened: bool,
     is_away: bool,
+    role: String,
+    status: String,
+    nick_color: String,
 }
 
 struct Channel {
@@ -91,6 +95,9 @@ pub struct SpeakVApp {
     user_volumes: Arc<Mutex<HashMap<String, f32>>>,
     last_typing_sent: Instant,
     active_chat_tab: ChatTab,
+    role: String,
+    status_input: String,
+    nick_color_input: String,
 }
 
 impl SpeakVApp {
@@ -193,6 +200,9 @@ impl SpeakVApp {
             user_volumes,
             last_typing_sent: Instant::now(),
             active_chat_tab: ChatTab::Chat,
+            role: "User".to_string(),
+            status_input: String::new(),
+            nick_color_input: "#FFFFFF".to_string(),
         };
 
         // Auto-start server and connect
@@ -320,6 +330,29 @@ impl SpeakVApp {
     }
 }
 
+fn play_notification_beep() {
+    std::thread::spawn(|| {
+        if let Ok((_stream, stream_handle)) = rodio::OutputStream::try_default() {
+            let sink = rodio::Sink::try_new(&stream_handle).unwrap();
+            let source = rodio::source::SineWave::new(880.0)
+                .take_duration(std::time::Duration::from_millis(100))
+                .amplify(0.2);
+            sink.append(source);
+            sink.sleep_until_end();
+        }
+    });
+}
+
+fn hex_to_color(hex: &str) -> Result<egui::Color32, ()> {
+    if !hex.starts_with('#') || hex.len() != 7 {
+        return Err(());
+    }
+    let r = u8::from_str_radix(&hex[1..3], 16).map_err(|_| ())?;
+    let g = u8::from_str_radix(&hex[3..5], 16).map_err(|_| ())?;
+    let b = u8::from_str_radix(&hex[5..7], 16).map_err(|_| ())?;
+    Ok(egui::Color32::from_rgb(r, g, b))
+}
+
 impl eframe::App for SpeakVApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Handle incoming network chat messages
@@ -327,25 +360,59 @@ impl eframe::App for SpeakVApp {
             self.is_connected = *net.is_connected.lock().unwrap();
             while let Ok(packet) = net.chat_rx.try_recv() {
                 if let crate::network::NetworkPacket::ChatMessage { username, message, timestamp } = packet {
+                    let decrypted_msg = crate::network::decrypt_bytes(&message)
+                        .and_then(|b| String::from_utf8(b).ok())
+                        .unwrap_or_else(|| "[Decryption Failed]".to_string());
+
                     self.chat_messages.push(ChatMessage {
-                        username,
-                        message,
+                        username: username.clone(),
+                        message: decrypted_msg,
                         timestamp,
                     });
-                } else if let crate::network::NetworkPacket::AuthResponse { success, message } = packet {
+                    if username != self.username {
+                        play_notification_beep();
+                    }
+                } else if let crate::network::NetworkPacket::ChatHistory(history) = packet {
+                    for p in history {
+                        if let crate::network::NetworkPacket::ChatMessage { username, message, timestamp } = p {
+                            let decrypted_msg = crate::network::decrypt_bytes(&message)
+                                .and_then(|b| String::from_utf8(b).ok())
+                                .unwrap_or_else(|| "[Decryption Failed]".to_string());
+
+                            self.chat_messages.push(ChatMessage {
+                                username,
+                                message: decrypted_msg,
+                                timestamp,
+                            });
+                        }
+                    }
+                } else if let crate::network::NetworkPacket::AuthResponse { success, message, role, status, nick_color } = packet {
                     self.is_authenticated = success;
                     self.auth_message = message;
                     if success {
                         self.username = self.login_input.clone();
+                        if let Some(r) = role {
+                            self.role = r;
+                        }
+                        if let Some(s) = status {
+                            self.status_input = s;
+                        }
+                        if let Some(c) = nick_color {
+                            self.nick_color_input = c;
+                        }
                         self.save_username();
+                        // Request initial history for Lobby
+                        let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::RequestChatHistory { 
+                            channel: "Lobby".to_string() 
+                        });
                     }
                 } else if let crate::network::NetworkPacket::UsersUpdate(chan_state) = packet {
                     // Update participants (flat list)
                     self.participants.clear();
                     for (_chan_name, users) in &chan_state {
-                        for user in users {
-                            if !self.participants.contains(user) {
-                                self.participants.push(user.clone());
+                        for user_info in users {
+                            if !self.participants.contains(&user_info.username) {
+                                self.participants.push(user_info.username.clone());
                             }
                         }
                     }
@@ -359,13 +426,16 @@ impl eframe::App for SpeakVApp {
                             .unwrap_or(true);
                         
                         let mut user_list = Vec::new();
-                        for user_name in users {
+                        for user_info in users {
                             user_list.push(User {
-                                name: user_name.clone(),
-                                is_speaking: self.speaking_users.contains_key(&user_name),
-                                is_muted: false, // These will be handled by per-user volume/context menu
+                                name: user_info.username.clone(),
+                                is_speaking: self.speaking_users.contains_key(&user_info.username),
+                                is_muted: user_info.is_muted,
                                 is_deafened: false,
                                 is_away: false,
+                                role: user_info.role,
+                                status: user_info.status,
+                                nick_color: user_info.nick_color,
                             });
                         }
 
@@ -393,6 +463,23 @@ impl eframe::App for SpeakVApp {
                         self.typing_users.insert(username, Instant::now());
                     } else {
                         self.typing_users.remove(&username);
+                    }
+                } else if let crate::network::NetworkPacket::ChatHistory(history) = packet {
+                    // Handled in the chat_rx loop above but keeping this if needed for other tabs
+                    // Wait, let's just make it consistent.
+                    self.chat_messages.clear();
+                    for msg_packet in history {
+                        if let crate::network::NetworkPacket::ChatMessage { username, message, timestamp } = msg_packet {
+                            let decrypted_msg = crate::network::decrypt_bytes(&message)
+                                .and_then(|b| String::from_utf8(b).ok())
+                                .unwrap_or_else(|| "[Decryption Failed]".to_string());
+
+                            self.chat_messages.push(ChatMessage {
+                                username,
+                                message: decrypted_msg,
+                                timestamp,
+                            });
+                        }
                     }
                 }
             }
@@ -653,6 +740,7 @@ impl eframe::App for SpeakVApp {
                                 if ui.selectable_label(is_current, label_text).clicked() {
                                     if let Some(_net) = &self.network_manager {
                                         let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::JoinChannel(channel.name.clone()));
+                                        let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::RequestChatHistory { channel: channel.name.clone() });
                                     }
                                 }
 
@@ -675,7 +763,61 @@ impl eframe::App for SpeakVApp {
                                             color = egui::Color32::from_rgb(100, 200, 255);
                                         }
 
-                                        ui.label(egui::RichText::new(format!("{} {}", icon, user.name)).color(color));
+                                        let mut label = egui::RichText::new(format!("{} {}", icon, user.name)).color(color);
+                                        
+                                        // Apply nick color
+                                        if let Ok(c) = hex_to_color(&user.nick_color) {
+                                            label = label.color(c);
+                                        }
+
+                                        if user.role == "Admin" {
+                                            label = label.strong();
+                                            if user.role == "Admin" {
+                                                // Golden for Admin name if no custom color?
+                                                // Let's just make it bold and show the color.
+                                            }
+                                        }
+
+                                        let resp = ui.label(label);
+                                        if !user.status.is_empty() {
+                                            ui.label(egui::RichText::new(format!("({})", user.status)).size(10.0).color(egui::Color32::GRAY));
+                                        }
+                                        
+                                        // Admin context menu
+                                        if self.role == "Admin" && user.name != self.username {
+                                            resp.context_menu(|ui| {
+                                                ui.heading(format!("Admin Action for {}", user.name));
+                                                if ui.button("🔇 Mute (Server-wide)").clicked() {
+                                                    let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::AdminAction { 
+                                                        target: user.name.clone(), 
+                                                        action: crate::network::AdminActionType::Mute 
+                                                    });
+                                                    ui.close_menu();
+                                                }
+                                                if ui.button("🔊 Unmute").clicked() {
+                                                    let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::AdminAction { 
+                                                        target: user.name.clone(), 
+                                                        action: crate::network::AdminActionType::Unmute 
+                                                    });
+                                                    ui.close_menu();
+                                                }
+                                                ui.separator();
+                                                if ui.button("🚪 Kick").clicked() {
+                                                    let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::AdminAction { 
+                                                        target: user.name.clone(), 
+                                                        action: crate::network::AdminActionType::Kick 
+                                                    });
+                                                    ui.close_menu();
+                                                }
+                                                if ui.button("🚫 BAN").clicked() {
+                                                    let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::AdminAction { 
+                                                        target: user.name.clone(), 
+                                                        action: crate::network::AdminActionType::Ban 
+                                                    });
+                                                    ui.close_menu();
+                                                }
+                                            });
+                                        }
                                     });
                                 }
                                 
@@ -759,7 +901,7 @@ impl eframe::App for SpeakVApp {
                                         
                                         let resp = ui.label(label);
                                         
-                                        // Context menu for volume
+                                        // Context menu for volume and admin
                                         resp.context_menu(|ui| {
                                             ui.heading(format!("Settings for {}", user));
                                             if user != &self.username {
@@ -772,8 +914,29 @@ impl eframe::App for SpeakVApp {
                                                 if ui.button("Reset").clicked() {
                                                     *vol = 1.0;
                                                 }
+                                                
+                                                // Admin section in context menu
+                                                if self.role == "Admin" {
+                                                    ui.separator();
+                                                    ui.heading("Admin Actions");
+                                                    if ui.button("Kick").clicked() {
+                                                        let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::AdminAction { 
+                                                            target: user.clone(), 
+                                                            action: crate::network::AdminActionType::Kick 
+                                                        });
+                                                        ui.close_menu();
+                                                    }
+                                                    if ui.button("BAN").clicked() {
+                                                        let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::AdminAction { 
+                                                            target: user.clone(), 
+                                                            action: crate::network::AdminActionType::Ban 
+                                                        });
+                                                        ui.close_menu();
+                                                    }
+                                                }
                                             } else {
                                                 ui.label("This is you!");
+                                                ui.label(format!("Role: {}", self.role));
                                             }
                                         });
                                     });
@@ -814,9 +977,10 @@ impl eframe::App for SpeakVApp {
                                             timestamp,
                                         };
                                         
+                                        let encrypted = crate::network::encrypt_bytes(msg.message.as_bytes());
                                         let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::ChatMessage {
                                             username: msg.username.clone(),
-                                            message: msg.message.clone(),
+                                            message: encrypted,
                                             timestamp: msg.timestamp.clone(),
                                         });
 
@@ -1090,6 +1254,36 @@ impl eframe::App for SpeakVApp {
                     
                     self.render_update_section(ui);
                     
+                    ui.add_space(20.0);
+                    ui.separator();
+                    ui.heading("User Profile");
+                    ui.add_space(5.0);
+                    egui::Grid::new("profile_grid")
+                        .num_columns(2)
+                        .spacing([20.0, 10.0])
+                        .show(ui, |ui| {
+                            ui.label("Status:");
+                            ui.text_edit_singleline(&mut self.status_input);
+                            ui.end_row();
+
+                            ui.label("Nick Color (#RRGGBB):");
+                            ui.horizontal(|ui| {
+                                ui.text_edit_singleline(&mut self.nick_color_input);
+                                if let Ok(c) = hex_to_color(&self.nick_color_input) {
+                                    let (rect, _resp) = ui.allocate_at_least(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                                    ui.painter().circle_filled(rect.center(), 8.0, c);
+                                }
+                            });
+                            ui.end_row();
+                        });
+                    
+                    if ui.button("💾 Save Profile").clicked() {
+                        let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::UpdateProfile { 
+                            status: self.status_input.clone(), 
+                            nick_color: self.nick_color_input.clone() 
+                        });
+                    }
+
                     ui.add_space(20.0);
                     ui.separator();
                     ui.horizontal(|ui| {

@@ -1,23 +1,76 @@
-use tokio::net::UdpSocket;
-use std::sync::{Arc, Mutex};
-use ringbuf::{HeapRb, traits::{Consumer, Producer, Observer}};
-use anyhow::Result;
-use std::net::SocketAddr;
 use serde::{Serialize, Deserialize};
+use aes_gcm::{
+    aead::{Aead, AeadCore, KeyInit, OsRng},
+    Aes256Gcm, Nonce,
+};
+
+pub const STATIC_KEY: &[u8; 32] = b"SpeakV_Super_Secret_Key_2024_06!";
+
+pub fn encrypt_bytes(data: &[u8]) -> Vec<u8> {
+    let cipher = Aes256Gcm::new(STATIC_KEY.into());
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let ciphertext = cipher.encrypt(&nonce, data).unwrap_or_default();
+    let mut combined = nonce.to_vec();
+    combined.extend_from_slice(&ciphertext);
+    combined
+}
+
+pub fn decrypt_bytes(combined: &[u8]) -> Option<Vec<u8>> {
+    if combined.len() < 12 { return None; }
+    let cipher = Aes256Gcm::new(STATIC_KEY.into());
+    let nonce = Nonce::from_slice(&combined[..12]);
+    let ciphertext = &combined[12..];
+    cipher.decrypt(nonce, ciphertext).ok()
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum NetworkPacket {
     Handshake { username: String },
-    Audio { username: String, data: Vec<f32> },
-    ChatMessage { username: String, message: String, timestamp: String },
-    UsersUpdate(Vec<(String, Vec<String>)>), // Vec<(ChannelName, Vec<Username>)>
+    Audio { username: String, data: Vec<u8> },
+    ChatMessage { username: String, message: Vec<u8>, timestamp: String },
+    UsersUpdate(Vec<(String, Vec<UserInfo>)>), // Vec<(ChannelName, Vec<UserInfo>)>
     JoinChannel(String),
     CreateChannel(String),
     TypingStatus { username: String, is_typing: bool },
     Register { username: String, password: String },
     Login { username: String, password: String },
-    AuthResponse { success: bool, message: String },
+    AuthResponse { 
+        success: bool, 
+        message: String, 
+        role: Option<String>,
+        status: Option<String>,
+        nick_color: Option<String>,
+    },
     Ping,
+    RequestChatHistory { channel: String },
+    ChatHistory(Vec<NetworkPacket>), // Should contain ChatMessage variants
+    AdminAction { target: String, action: AdminActionType },
+    UpdateProfile { status: String, nick_color: String },
+}
+
+// Re-add imports needed for the rest of the file
+use tokio::net::UdpSocket;
+use std::sync::{Arc, Mutex};
+use ringbuf::{HeapRb, traits::{Consumer, Producer, Observer}};
+use anyhow::Result;
+use std::net::SocketAddr;
+
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct UserInfo {
+    pub username: String,
+    pub role: String,
+    pub is_muted: bool,
+    pub status: String,
+    pub nick_color: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum AdminActionType {
+    Kick,
+    Ban,
+    Mute,
+    Unmute,
 }
 
 type LocalProducer = ringbuf::CachingProd<Arc<HeapRb<f32>>>;
@@ -126,9 +179,12 @@ impl NetworkManager {
                 }
 
                 if has_audio {
+                    let audio_bytes: Vec<u8> = input_buf.iter().flat_map(|&f| f.to_le_bytes()).collect();
+                    let encrypted_audio = encrypt_bytes(&audio_bytes);
+                    
                     let packet = NetworkPacket::Audio {
                         username: username.clone(),
-                        data: input_buf.clone(),
+                        data: encrypted_audio,
                     };
                     if let Ok(encoded) = bincode::serialize(&packet) {
                         let _ = socket.send(&encoded).await;
@@ -140,26 +196,35 @@ impl NetworkManager {
                     Ok(len) = socket.recv(&mut receive_buf) => {
                         if let Ok(packet) = bincode::deserialize::<NetworkPacket>(&receive_buf[..len]) {
                             match packet {
-                                NetworkPacket::Audio { username, mut data } => {
-                                    // Apply per-user volume
-                                    let volume = {
-                                        let volumes = user_volumes.lock().unwrap();
-                                        *volumes.get(&username).unwrap_or(&1.0)
-                                    };
-                                    
-                                    if volume != 1.0 {
-                                        for x in &mut data {
-                                            *x *= volume;
+                                NetworkPacket::Audio { username, data } => {
+                                    if let Some(decrypted_bytes) = decrypt_bytes(&data) {
+                                        let mut decrypted_data = Vec::new();
+                                        for chunk in decrypted_bytes.chunks_exact(4) {
+                                            let mut bytes = [0u8; 4];
+                                            bytes.copy_from_slice(chunk);
+                                            decrypted_data.push(f32::from_le_bytes(bytes));
                                         }
-                                    }
 
-                                    let mut prod = remote_producer.lock().unwrap();
-                                    for &sample in &data {
-                                        let _ = prod.try_push(sample);
+                                        // Apply per-user volume
+                                        let volume = {
+                                            let volumes = user_volumes.lock().unwrap();
+                                            *volumes.get(&username).unwrap_or(&1.0)
+                                        };
+                                        
+                                        if volume != 1.0 {
+                                            for x in &mut decrypted_data {
+                                                *x *= volume;
+                                            }
+                                        }
+
+                                        let mut prod = remote_producer.lock().unwrap();
+                                        for &sample in &decrypted_data {
+                                            let _ = prod.try_push(sample);
+                                        }
+                                        let _ = speaking_tx.send(username);
                                     }
-                                    let _ = speaking_tx.send(username);
                                 }
-                                NetworkPacket::ChatMessage { .. } | NetworkPacket::UsersUpdate(_) | NetworkPacket::TypingStatus { .. } | NetworkPacket::AuthResponse { .. } => {
+                                NetworkPacket::ChatMessage { .. } | NetworkPacket::UsersUpdate(_) | NetworkPacket::TypingStatus { .. } | NetworkPacket::AuthResponse { .. } | NetworkPacket::ChatHistory(_) => {
                                     let _ = incoming_chat_tx.send(packet);
                                 }
                                 _ => {}
