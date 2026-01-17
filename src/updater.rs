@@ -148,6 +148,7 @@ impl UpdateManager {
                 .bin_name("speakv")
                 .target(&target)
                 .current_version(env!("CARGO_PKG_VERSION"))
+                .no_confirm(true)
                 .build()?
                 .update()?;
 
