@@ -86,7 +86,9 @@ pub struct SpeakVApp {
     chat_messages: Vec<ChatMessage>,
     chat_input: String,
     show_chat: bool,
-    outgoing_chat_tx: crossbeam_channel::Sender<crate::network::NetworkPacket>,
+    pub outgoing_chat_tx: tokio::sync::mpsc::UnboundedSender<crate::network::NetworkPacket>,
+    pub incoming_chat_rx: tokio::sync::mpsc::UnboundedReceiver<crate::network::NetworkPacket>,
+    pub speaking_users_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     participants: Vec<String>,
     typing_users: HashMap<String, Instant>,
     speaking_users: HashMap<String, Instant>,
@@ -149,11 +151,13 @@ impl SpeakVApp {
             },
         ];
 
-        let (tx_out, rx_out) = crossbeam_channel::unbounded();
+        let (outgoing_chat_tx, outgoing_chat_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (incoming_chat_tx, incoming_chat_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (speaking_users_tx, speaking_users_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let user_volumes = if let Some(net) = &network_manager { net.user_volumes.clone() } else { Arc::new(Mutex::new(HashMap::new())) };
 
-        let app = Self {
+        let mut app = Self {
             audio_manager,
             network_manager,
             update_manager: UpdateManager::new(),
@@ -189,7 +193,9 @@ impl SpeakVApp {
             chat_messages: Vec::new(),
             chat_input: String::new(),
             show_chat: true,
-            outgoing_chat_tx: tx_out,
+            outgoing_chat_tx,
+            incoming_chat_rx,
+            speaking_users_rx,
             participants: Vec::new(),
             typing_users: HashMap::new(),
             speaking_users: HashMap::new(),
@@ -207,15 +213,19 @@ impl SpeakVApp {
             let input_cons = audio.input_consumer.clone();
             let remote_prod = audio.remote_producer.clone();
             let addr = app.server_address.clone();
-            let tx_out_clone = app.outgoing_chat_tx.clone();
+            let outgoing_tx = app.outgoing_chat_tx.clone();
             let username_clone = app.username.clone();
+            
+            // Channel ends for network task
+            let network_out_rx = outgoing_chat_rx;
+            let network_in_tx = incoming_chat_tx;
+            let network_speaking_tx = speaking_users_tx;
 
             tokio::spawn(async move {
-                // Auto connect to the specified address
-                net_clone.start(addr, input_cons, remote_prod, rx_out, username_clone.clone());
+                net_clone.start(addr, input_cons, remote_prod, network_out_rx, network_in_tx, network_speaking_tx, username_clone.clone());
 
                 // Send handshake
-                let _ = tx_out_clone.send(crate::network::NetworkPacket::Handshake { 
+                let _ = outgoing_tx.send(crate::network::NetworkPacket::Handshake { 
                     username: username_clone 
                 });
             });
@@ -334,7 +344,7 @@ impl eframe::App for SpeakVApp {
         // Handle incoming network chat messages
         if let Some(net) = &self.network_manager {
             self.is_connected = *net.is_connected.lock().unwrap();
-            while let Ok(packet) = net.chat_rx.try_recv() {
+            while let Ok(packet) = self.incoming_chat_rx.try_recv() {
                 if let crate::network::NetworkPacket::ChatMessage { username, message, timestamp } = packet {
                     let decrypted_msg = crate::network::decrypt_bytes(&message)
                         .and_then(|b| String::from_utf8(b).ok())
@@ -465,10 +475,8 @@ impl eframe::App for SpeakVApp {
         self.typing_users.retain(|_, &mut last_seen| last_seen.elapsed().as_secs_f32() < 3.0);
         
         // Handle speaking indicators
-        if let Some(net) = &self.network_manager {
-            while let Ok(username) = net.speaking_users_rx.try_recv() {
-                self.speaking_users.insert(username, Instant::now());
-            }
+        while let Ok(username) = self.speaking_users_rx.try_recv() {
+            self.speaking_users.insert(username, Instant::now());
         }
         self.speaking_users.retain(|_, &mut last_seen| last_seen.elapsed().as_secs_f32() < 0.2);
 
@@ -516,14 +524,21 @@ impl eframe::App for SpeakVApp {
                                     // Connect if not connected
                                     if !self.is_connected {
                                         if let (Some(net), Some(audio)) = (&mut self.network_manager, &self.audio_manager) {
-                                            let (tx_out, rx_out) = crossbeam_channel::unbounded();
+                                            let (tx_out, rx_out) = tokio::sync::mpsc::unbounded_channel();
+                                            let (tx_in, rx_in) = tokio::sync::mpsc::unbounded_channel();
+                                            let (tx_sp, rx_sp) = tokio::sync::mpsc::unbounded_channel();
+                                            
                                             self.outgoing_chat_tx = tx_out.clone();
+                                            self.incoming_chat_rx = rx_in;
+                                            self.speaking_users_rx = rx_sp;
 
                                             net.start(
                                                 self.server_address.clone(),
                                                 audio.input_consumer.clone(),
                                                 audio.remote_producer.clone(),
                                                 rx_out,
+                                                tx_in,
+                                                tx_sp,
                                                 self.login_input.clone(),
                                             );
 
@@ -642,14 +657,21 @@ impl eframe::App for SpeakVApp {
                                 }
                             } else {
                                 if let (Some(net), Some(audio)) = (&mut self.network_manager, &self.audio_manager) {
-                                    let (tx_out, rx_out) = crossbeam_channel::unbounded();
+                                    let (tx_out, rx_out) = tokio::sync::mpsc::unbounded_channel();
+                                    let (tx_in, rx_in) = tokio::sync::mpsc::unbounded_channel();
+                                    let (tx_sp, rx_sp) = tokio::sync::mpsc::unbounded_channel();
+                                    
                                     self.outgoing_chat_tx = tx_out.clone();
+                                    self.incoming_chat_rx = rx_in;
+                                    self.speaking_users_rx = rx_sp;
 
                                     net.start(
                                         self.server_address.clone(),
                                         audio.input_consumer.clone(),
                                         audio.remote_producer.clone(),
                                         rx_out,
+                                        tx_in,
+                                        tx_sp,
                                         self.username.clone(),
                                     );
 
