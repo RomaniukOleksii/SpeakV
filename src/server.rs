@@ -93,6 +93,19 @@ pub async fn run_server() -> anyhow::Result<()> {
         )",
         [],
     )?;
+    db_conn.execute(
+        "CREATE TABLE IF NOT EXISTS file_messages (
+            id INTEGER PRIMARY KEY,
+            username TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            recipient TEXT, -- NULL for channel files
+            filename TEXT NOT NULL,
+            data BLOB NOT NULL,
+            is_image INTEGER NOT NULL,
+            timestamp TEXT NOT NULL
+        )",
+        [],
+    )?;
     
     // Default channels
     let _ = db_conn.execute("INSERT OR IGNORE INTO channels (name) VALUES ('Lobby')", []);
@@ -111,9 +124,11 @@ pub async fn run_server() -> anyhow::Result<()> {
             }
         }
     }
+    println!("Server: Loaded channels from DB: {:?}", initial_channels);
 
     let clients: Arc<Mutex<HashMap<SocketAddr, ClientInfo>>> = Arc::new(Mutex::new(HashMap::new()));
     let channels: Arc<Mutex<std::collections::HashSet<String>>> = Arc::new(Mutex::new(initial_channels));
+    let file_reassemblers: Arc<Mutex<HashMap<uuid::Uuid, crate::app::PendingFile>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let mut buf = [0u8; 4096];
 
@@ -339,16 +354,44 @@ pub async fn run_server() -> anyhow::Result<()> {
                                         timestamp: row.get(2)?,
                                     })
                                 }).unwrap();
+                                
+                                let mut final_history = Vec::new();
+                                for r in rows { if let Ok(p) = r { final_history.push(p); } }
 
-                                let mut msgs: Vec<_> = rows.filter_map(|r| r.ok()).collect();
-                                msgs.reverse(); // Newest last for display
-                                msgs
+                                // Fetch file messages for this channel
+                                let mut stmt_files = db_lock.prepare(
+                                    "SELECT username, filename, data, is_image, timestamp FROM file_messages 
+                                     WHERE channel = ?1 AND recipient IS NULL ORDER BY id DESC LIMIT 50"
+                                ).unwrap();
+                                let file_rows = stmt_files.query_map(params![channel], |row| {
+                                    Ok(crate::network::NetworkPacket::FileMessage {
+                                        from: row.get(0)?,
+                                        to: None,
+                                        filename: row.get(1)?,
+                                        data: row.get::<_, Vec<u8>>(2)?,
+                                        is_image: row.get::<_, i32>(3)? == 1,
+                                        timestamp: row.get(4)?,
+                                    })
+                                }).unwrap();
+                                for r in file_rows { if let Ok(p) = r { final_history.push(p); } }
+                                
+                                // Sort combined by timestamp? Or just leave it as is for now.
+                                // Actually, it's better to sort.
+                                final_history.sort_by(|a, b| {
+                                    let get_ts = |p: &crate::network::NetworkPacket| match p {
+                                        crate::network::NetworkPacket::ChatMessage { timestamp, .. } => timestamp.clone(),
+                                        crate::network::NetworkPacket::FileMessage { timestamp, .. } => timestamp.clone(),
+                                        _ => "".to_string(),
+                                    };
+                                    get_ts(a).cmp(&get_ts(b))
+                                });
+                                
+                                final_history
                             };
-
-                            let response = crate::network::NetworkPacket::ChatHistory(history);
-                            if let Ok(encoded) = bincode::serialize(&response) {
-                                let _ = socket.send_to(&encoded, addr).await;
-                            }
+                            
+                            let packet = crate::network::NetworkPacket::ChatHistory(history);
+                            let encoded = bincode::serialize(&packet).unwrap();
+                            let _ = socket.send_to(&encoded, addr).await;
                         }
                     }
                 }
@@ -425,18 +468,138 @@ pub async fn run_server() -> anyhow::Result<()> {
                                         timestamp: row.get(3)?,
                                     })
                                 }).unwrap();
+                                
+                                let mut final_history = Vec::new();
+                                for r in rows { if let Ok(p) = r { final_history.push(p); } }
 
-                                let mut msgs: Vec<_> = rows.filter_map(|r| r.ok()).collect();
-                                msgs.reverse();
-                                msgs
+                                // Fetch file messages for this DM
+                                let mut stmt_files = db_lock.prepare(
+                                    "SELECT username, recipient, filename, data, is_image, timestamp FROM file_messages 
+                                     WHERE (username = ?1 AND recipient = ?2) OR (username = ?2 AND recipient = ?1)
+                                     ORDER BY id DESC LIMIT 50"
+                                ).unwrap();
+                                let file_rows = stmt_files.query_map(params![me, target], |row| {
+                                    Ok(crate::network::NetworkPacket::FileMessage {
+                                        from: row.get(0)?,
+                                        to: Some(row.get(1)?),
+                                        filename: row.get(2)?,
+                                        data: row.get::<_, Vec<u8>>(3)?,
+                                        is_image: row.get::<_, i32>(4)? == 1,
+                                        timestamp: row.get(5)?,
+                                    })
+                                }).unwrap();
+                                for r in file_rows { if let Ok(p) = r { final_history.push(p); } }
+                                
+                                final_history.sort_by(|a, b| {
+                                    let get_ts = |p: &crate::network::NetworkPacket| match p {
+                                        crate::network::NetworkPacket::ChatMessage { timestamp, .. } => timestamp.clone(),
+                                        crate::network::NetworkPacket::PrivateMessage { timestamp, .. } => timestamp.clone(),
+                                        crate::network::NetworkPacket::FileMessage { timestamp, .. } => timestamp.clone(),
+                                        _ => "".to_string(),
+                                    };
+                                    get_ts(a).cmp(&get_ts(b))
+                                });
+                                
+                                final_history
                             };
-
+                            
                             let response = crate::network::NetworkPacket::DirectHistory(history);
-                            if let Ok(encoded) = bincode::serialize(&response) {
-                                let _ = socket.send_to(&encoded, addr).await;
+                            let encoded = bincode::serialize(&response).unwrap();
+                            let _ = socket.send_to(&encoded, addr).await;
+                        }
+                    }
+                }
+                crate::network::NetworkPacket::FileStart { id, from, to, filename, total_chunks, is_image, timestamp } => {
+                    let mut sender_channel = "Lobby".to_string();
+                    let mut authenticated = false;
+                    if let Some(info) = clients_guard.get(&addr) {
+                        sender_channel = info.current_channel.clone();
+                        authenticated = info.is_authenticated;
+                    }
+
+                    if authenticated {
+                        let mut reassemblers = file_reassemblers.lock().await;
+                        reassemblers.insert(*id, crate::app::PendingFile {
+                            filename: filename.clone(),
+                            from: from.clone(),
+                            to: to.clone(),
+                            is_image: *is_image,
+                            timestamp: timestamp.clone(),
+                            chunks: vec![None; *total_chunks],
+                            total_chunks: *total_chunks,
+                            received_count: 0,
+                        });
+
+                        if let Some(target) = to {
+                            let recipient_addr = clients_guard.iter()
+                                .find(|(_, info)| info.username == *target)
+                                .map(|(&addr, _)| addr);
+                            if let Some(target_addr) = recipient_addr {
+                                let _ = socket.send_to(&buf[..len], target_addr).await;
+                            }
+                        } else {
+                            for (&client_addr, info) in clients_guard.iter() {
+                                if client_addr != addr && info.current_channel == sender_channel && info.is_authenticated {
+                                    let _ = socket.send_to(&buf[..len], client_addr).await;
+                                }
                             }
                         }
                     }
+                }
+                crate::network::NetworkPacket::FileChunk { id, chunk_index, data } => {
+                     // In a real high-perf server, we'd have a reassembler here.
+                     // For now, let's JUST relay the chunks. 
+                     // To store in DB, we'd need to reassemble on server too.
+                     // Let's implement a simple server-side reassembler for DB persistence.
+                     
+                     // Relay first
+                     let mut sender_channel = "Lobby".to_string();
+                     let mut authenticated = false;
+                     let mut from_user = String::new();
+                     if let Some(info) = clients_guard.get(&addr) {
+                         sender_channel = info.current_channel.clone();
+                         authenticated = info.is_authenticated;
+                         from_user = info.username.clone();
+                     }
+                     
+                     if authenticated {
+                        // Relay
+                        for (&client_addr, info) in clients_guard.iter() {
+                             if client_addr != addr && info.is_authenticated {
+                                 let _ = socket.send_to(&buf[..len], client_addr).await;
+                             }
+                        }
+
+                        // Reassemble for DB
+                        let mut reassemblers = file_reassemblers.lock().await;
+                        if let Some(pending) = reassemblers.get_mut(id) {
+                            if *chunk_index < pending.total_chunks && pending.chunks[*chunk_index].is_none() {
+                                pending.chunks[*chunk_index] = Some(data.clone());
+                                pending.received_count += 1;
+
+                                if pending.received_count == pending.total_chunks {
+                                    let mut full_data = Vec::new();
+                                    for chunk in pending.chunks.drain(..) {
+                                        if let Some(c) = chunk { full_data.extend(c); }
+                                    }
+                                    
+                                    let from = pending.from.clone();
+                                    let channel = sender_channel.clone();
+                                    let recipient = pending.to.clone();
+                                    let filename = pending.filename.clone();
+                                    let is_image = pending.is_image;
+                                    let timestamp = pending.timestamp.clone();
+                                    
+                                    let db_lock = db.lock().unwrap();
+                                    let _ = db_lock.execute(
+                                        "INSERT INTO file_messages (username, channel, recipient, filename, data, is_image, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                                        params![from, channel, recipient, filename, full_data, if is_image { 1 } else { 0 }, timestamp],
+                                    );
+                                    reassemblers.remove(&id);
+                                }
+                            }
+                        }
+                     }
                 }
                 crate::network::NetworkPacket::Ping => {
                     if let Some(info) = clients_guard.get_mut(&addr) {

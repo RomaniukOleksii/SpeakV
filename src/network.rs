@@ -50,6 +50,9 @@ pub enum NetworkPacket {
     PrivateMessage { from: String, to: String, message: Vec<u8>, timestamp: String },
     RequestDirectHistory { target: String },
     DirectHistory(Vec<NetworkPacket>),
+    FileMessage { from: String, to: Option<String>, filename: String, data: Vec<u8>, is_image: bool, timestamp: String },
+    FileStart { id: uuid::Uuid, from: String, to: Option<String>, filename: String, total_chunks: usize, is_image: bool, timestamp: String },
+    FileChunk { id: uuid::Uuid, chunk_index: usize, data: Vec<u8> },
 }
 
 // Re-add imports needed for the rest of the file

@@ -3,9 +3,12 @@ use crate::audio::AudioManager;
 use crate::network::NetworkManager;
 use crate::updater::{UpdateManager, UpdateStatus};
 use std::collections::HashMap;
-use std::fs;
+use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::net::SocketAddr;
+use std::fs;
+use rfd::FileDialog;
+use image::GenericImageView;
 use rodio::Source;
 
 struct User {
@@ -36,6 +39,18 @@ struct ChatMessage {
     username: String,
     message: String,
     timestamp: String,
+    file_data: Option<(String, Vec<u8>, bool)>, // filename, data, is_image
+}
+
+pub struct PendingFile {
+    pub filename: String,
+    pub from: String,
+    pub to: Option<String>,
+    pub is_image: bool,
+    pub timestamp: String,
+    pub chunks: Vec<Option<Vec<u8>>>,
+    pub total_chunks: usize,
+    pub received_count: usize,
 }
 
 #[derive(PartialEq)]
@@ -101,6 +116,8 @@ pub struct SpeakVApp {
     error_message: Option<String>,
     selected_dm_target: Option<String>,
     direct_messages: HashMap<String, Vec<ChatMessage>>,
+    image_cache: HashMap<String, egui::TextureHandle>,
+    pending_files: HashMap<uuid::Uuid, PendingFile>,
 }
 
 impl SpeakVApp {
@@ -190,6 +207,8 @@ impl SpeakVApp {
             error_message: None,
             selected_dm_target: None,
             direct_messages: HashMap::new(),
+            image_cache: HashMap::new(),
+            pending_files: HashMap::new(),
         };
 
         // Auto-connect
@@ -340,6 +359,7 @@ impl eframe::App for SpeakVApp {
                         username: username.clone(),
                         message: decrypted_msg,
                         timestamp,
+                        file_data: None,
                     });
                     if username != self.username {
                         play_notification_beep();
@@ -426,11 +446,21 @@ impl eframe::App for SpeakVApp {
                         .and_then(|b| String::from_utf8(b).ok())
                         .unwrap_or_else(|| "[Decryption Failed]".to_string());
 
-                    let other = if from == self.username { to } else { from };
+                    let other = if from == self.username { to.clone() } else { from.clone() };
                     self.direct_messages.entry(other.clone()).or_default().push(ChatMessage {
-                        username: other,
+                        username: from,
                         message: decrypted_msg,
                         timestamp,
+                        file_data: None,
+                    });
+                    play_notification_beep();
+                } else if let crate::network::NetworkPacket::FileMessage { from, to, filename, data, is_image, timestamp } = packet {
+                    let other = if from == self.username { to.clone().unwrap_or_default() } else { from.clone() };
+                    self.direct_messages.entry(other.clone()).or_default().push(ChatMessage {
+                        username: from,
+                        message: format!("Sent a file: {}", filename),
+                        timestamp,
+                        file_data: Some((filename, data, is_image)),
                     });
                     play_notification_beep();
                 } else if let crate::network::NetworkPacket::DirectHistory(history) = packet {
@@ -444,10 +474,11 @@ impl eframe::App for SpeakVApp {
                                     .unwrap_or_else(|| "[Decryption Failed]".to_string());
                                 
                                 let display_name = if from == self.username { "You".to_string() } else { from };
-                                msgs.push(ChatMessage {
+                               msgs.push(ChatMessage {
                                     username: display_name,
                                     message: decrypted_msg,
                                     timestamp,
+                                    file_data: None,
                                 });
                             }
                         }
@@ -464,7 +495,73 @@ impl eframe::App for SpeakVApp {
                                 username,
                                 message: decrypted_msg,
                                 timestamp,
+                                file_data: None,
                             });
+                        } else if let crate::network::NetworkPacket::FileMessage { from, to: _, filename, data, is_image, timestamp } = p {
+                            self.chat_messages.push(ChatMessage {
+                                username: from,
+                                message: format!("Sent a file: {}", filename),
+                                timestamp,
+                                file_data: Some((filename, data, is_image)),
+                            });
+                        }
+                    }
+                } else if let crate::network::NetworkPacket::FileStart { id, from, to, filename, total_chunks, is_image, timestamp } = packet {
+                    self.pending_files.insert(id, PendingFile {
+                        filename, from, to, is_image, timestamp,
+                        chunks: vec![None; total_chunks],
+                        total_chunks,
+                        received_count: 0,
+                    });
+                } else if let crate::network::NetworkPacket::FileChunk { id, chunk_index, data } = packet {
+                    if let Some(pending) = self.pending_files.get_mut(&id) {
+                        if chunk_index < pending.total_chunks && pending.chunks[chunk_index].is_none() {
+                            pending.chunks[chunk_index] = Some(data);
+                            pending.received_count += 1;
+                            
+                            if pending.received_count == pending.total_chunks {
+                                // Reassemble and finalize
+                                let mut full_data = Vec::new();
+                                for chunk in pending.chunks.drain(..) {
+                                    if let Some(c) = chunk { full_data.extend(c); }
+                                }
+                                
+                                let from = pending.from.clone();
+                                let to = pending.to.clone();
+                                let filename = pending.filename.clone();
+                                let is_image = pending.is_image;
+                                let timestamp = pending.timestamp.clone();
+                                
+                                // Process as completed FileMessage
+                                let finalized_packet = crate::network::NetworkPacket::FileMessage {
+                                    from: from.clone(),
+                                    to: to.clone(),
+                                    filename: filename.clone(),
+                                    data: full_data.clone(),
+                                    is_image,
+                                    timestamp: timestamp.clone(),
+                                };
+                                
+                                // Manual re-dispatch to existing logic
+                                if let Some(target_dm) = to {
+                                    let other = if from == self.username { target_dm } else { from.clone() };
+                                    self.direct_messages.entry(other.clone()).or_default().push(ChatMessage {
+                                        username: from.clone(),
+                                        message: format!("Sent a file: {}", filename),
+                                        timestamp,
+                                        file_data: Some((filename, full_data, is_image)),
+                                    });
+                                } else {
+                                    self.chat_messages.push(ChatMessage {
+                                        username: from,
+                                        message: format!("Sent a file: {}", filename),
+                                        timestamp,
+                                        file_data: Some((filename, full_data, is_image)),
+                                    });
+                                }
+                                play_notification_beep();
+                                self.pending_files.remove(&id);
+                            }
                         }
                     }
                 }
@@ -1002,8 +1099,66 @@ impl eframe::App for SpeakVApp {
                                 let response = ui.add(
                                     egui::TextEdit::singleline(&mut self.chat_input)
                                         .hint_text("Type a message...")
-                                        .desired_width(ui.available_width() - 60.0)
+                                        .desired_width(ui.available_width() - 100.0) // Adjusted for 📎 button
                                 );
+                                
+                                    if let Some(path) = FileDialog::new()
+                                        .add_filter("Images/Files", &["png", "jpg", "jpeg", "gif", "txt", "pdf", "zip"])
+                                        .pick_file() 
+                                    {
+                                        if let Ok(data) = std::fs::read(&path) {
+                                            if data.len() > 10 * 1024 * 1024 {
+                                                self.error_message = Some("File too large (max 10MB)".to_string());
+                                            } else {
+                                                let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                                let is_image = filename.ends_with(".png") || filename.ends_with(".jpg") || filename.ends_with(".jpeg") || filename.ends_with(".gif");
+                                                let timestamp = chrono::Local::now().format("%H:%M").to_string();
+                                                let id = uuid::Uuid::new_v4();
+                                                
+                                                let chunk_size = 32 * 1024;
+                                                let total_chunks = (data.len() + chunk_size - 1) / chunk_size;
+                                                
+                                                // Send FileStart
+                                                let start_packet = crate::network::NetworkPacket::FileStart {
+                                                    id,
+                                                    from: self.username.clone(),
+                                                    to: self.selected_dm_target.clone(),
+                                                    filename: filename.clone(),
+                                                    total_chunks,
+                                                    is_image,
+                                                    timestamp: timestamp.clone(),
+                                                };
+                                                let _ = self.outgoing_chat_tx.send(start_packet);
+                                                
+                                                // Send Chunks
+                                                for (idx, chunk) in data.chunks(chunk_size).enumerate() {
+                                                    let chunk_packet = crate::network::NetworkPacket::FileChunk {
+                                                        id,
+                                                        chunk_index: idx,
+                                                        data: chunk.to_vec(),
+                                                    };
+                                                    let _ = self.outgoing_chat_tx.send(chunk_packet);
+                                                }
+                                                
+                                                // Locally add to history
+                                                if let Some(target) = &self.selected_dm_target {
+                                                    self.direct_messages.entry(target.clone()).or_default().push(ChatMessage {
+                                                        username: "You".to_string(),
+                                                        message: format!("Sent a file: {}", filename),
+                                                        timestamp: timestamp.clone(),
+                                                        file_data: Some((filename, data, is_image)),
+                                                    });
+                                                } else {
+                                                    self.chat_messages.push(ChatMessage {
+                                                        username: "You".to_string(),
+                                                        message: format!("Sent a file: {}", filename),
+                                                        timestamp: timestamp.clone(),
+                                                        file_data: Some((filename, data, is_image)),
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
                                 
                                 if response.changed() {
                                     if self.last_typing_sent.elapsed().as_secs_f32() > 0.5 {
@@ -1023,6 +1178,7 @@ impl eframe::App for SpeakVApp {
                                             username: self.username.clone(),
                                             message: self.chat_input.clone(),
                                             timestamp,
+                                            file_data: None,
                                         };
                                         
                                         let encrypted = crate::network::encrypt_bytes(msg.message.as_bytes());
@@ -1039,6 +1195,7 @@ impl eframe::App for SpeakVApp {
                                                 username: "You".to_string(),
                                                 message: self.chat_input.clone(),
                                                 timestamp: msg.timestamp.clone(),
+                                                file_data: None,
                                             });
                                         } else {
                                             let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::ChatMessage {
@@ -1097,6 +1254,36 @@ impl eframe::App for SpeakVApp {
                                                     .color(egui::Color32::from_rgb(100, 200, 255)));
                                             });
                                             ui.label(&msg.message);
+                                            
+                                            // Render file attachment
+                                            if let Some((filename, data, is_image)) = &msg.file_data {
+                                                if *is_image {
+                                                    let cache_key = format!("{}_{}", msg.username, filename);
+                                                    if let Some(texture) = self.image_cache.get(&cache_key) {
+                                                        ui.add(egui::Image::new(texture).max_width(200.0));
+                                                    } else {
+                                                        // Decode and load texture
+                                                        if let Ok(img) = image::load_from_memory(data) {
+                                                            let size = [img.width() as _, img.height() as _];
+                                                            let pixels = img.to_rgba8().into_raw();
+                                                            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+                                                            let texture = ui.ctx().load_texture(&cache_key, color_image, Default::default());
+                                                            self.image_cache.insert(cache_key, texture);
+                                                        } else {
+                                                            ui.label(egui::RichText::new("[Image Corrupted]").color(egui::Color32::RED));
+                                                        }
+                                                    }
+                                                } else {
+                                                    if ui.button(format!("💾 Save {}", filename)).clicked() {
+                                                        if let Some(path) = FileDialog::new()
+                                                            .set_file_name(filename)
+                                                            .save_file() 
+                                                        {
+                                                            let _ = std::fs::write(path, data);
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             ui.add_space(8.0);
                                         }
                                     });
