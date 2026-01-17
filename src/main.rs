@@ -1,12 +1,4 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
-
-mod app;
-mod audio;
-mod network;
-mod server;
-mod updater;
-
-use app::SpeakVApp;
+use speakv::app::SpeakVApp;
 use eframe::egui;
 
 #[tokio::main]

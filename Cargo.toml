@@ -4,6 +4,18 @@ version = "0.6.0"
 edition = "2021"
 default-run = "speakv"
 
+[lib]
+name = "speakv"
+path = "src/lib.rs"
+
+[[bin]]
+name = "speakv"
+path = "src/main.rs"
+
+[[bin]]
+name = "speakv-server"
+path = "src/bin/server.rs"
+
 [dependencies]
 eframe = "0.29.1" # GUI
 egui = "0.29.1"

@@ -81,8 +81,6 @@ pub struct SpeakVApp {
     new_channel_name: String,
     server_address: String,
     is_connected: bool,
-    is_host: Arc<Mutex<bool>>,
-    public_ip: Arc<Mutex<String>>,
     
     // Chat State
     chat_messages: Vec<ChatMessage>,
@@ -187,8 +185,6 @@ impl SpeakVApp {
             new_channel_name: String::new(),
             server_address: "127.0.0.1:9999".to_string(),
             is_connected: false,
-            is_host: Arc::new(Mutex::new(false)),
-            public_ip: Arc::new(Mutex::new("Fetching...".to_string())),
             
             chat_messages: Vec::new(),
             chat_input: String::new(),
@@ -205,37 +201,17 @@ impl SpeakVApp {
             nick_color_input: "#FFFFFF".to_string(),
         };
 
-        // Auto-start server and connect
+        // Auto-connect
         if let (Some(net), Some(audio)) = (&app.network_manager, &app.audio_manager) {
             let net_clone = net.clone();
             let input_cons = audio.input_consumer.clone();
             let remote_prod = audio.remote_producer.clone();
             let addr = app.server_address.clone();
-            let is_host_clone = app.is_host.clone();
-            let public_ip_clone = app.public_ip.clone();
             let tx_out_clone = app.outgoing_chat_tx.clone();
             let username_clone = app.username.clone();
 
             tokio::spawn(async move {
-                // Try to be the host
-                if let Err(e) = crate::server::run_server().await {
-                    println!("Not starting server (likely already running): {}", e);
-                } else {
-                    println!("Successfully started server as host.");
-                    if let Ok(mut host) = is_host_clone.lock() {
-                        *host = true;
-                    }
-                    
-                    // Fetch public IP for the host
-                    if let Some(ip) = public_ip::addr().await {
-                        if let Ok(mut p_ip) = public_ip_clone.lock() {
-                            *p_ip = ip.to_string();
-                        }
-                    }
-                }
-                
-                // Auto connect
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                // Auto connect to the specified address
                 net_clone.start(addr, input_cons, remote_prod, rx_out, username_clone.clone());
 
                 // Send handshake
@@ -694,14 +670,6 @@ impl eframe::App for SpeakVApp {
                     });
 
                     ui.add_space(10.0);
-                    if let Ok(host) = self.is_host.lock() {
-                        if *host {
-                            ui.label(egui::RichText::new("HOST").strong().color(egui::Color32::GOLD));
-                            if let Ok(ip) = self.public_ip.lock() {
-                                ui.label(egui::RichText::new(format!("(IP: {})", *ip)).color(egui::Color32::from_rgb(200, 150, 50)));
-                            }
-                        }
-                    }
                     ui.label(egui::RichText::new(format!("Logged in as: {}", self.username)).color(egui::Color32::LIGHT_GRAY));
                 });
             });
