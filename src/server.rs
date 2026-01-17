@@ -83,6 +83,16 @@ pub async fn run_server() -> anyhow::Result<()> {
         )",
         [],
     )?;
+    db_conn.execute(
+        "CREATE TABLE IF NOT EXISTS private_messages (
+            id INTEGER PRIMARY KEY,
+            sender TEXT NOT NULL,
+            recipient TEXT NOT NULL,
+            message BLOB NOT NULL,
+            timestamp TEXT NOT NULL
+        )",
+        [],
+    )?;
     
     // Default channels
     let _ = db_conn.execute("INSERT OR IGNORE INTO channels (name) VALUES ('Lobby')", []);
@@ -368,6 +378,62 @@ pub async fn run_server() -> anyhow::Result<()> {
                                 info.last_seen = tokio::time::Instant::now();
                                 println!("Server: {} joined '{}'", info.username, name);
                                 needs_broadcast = true;
+                            }
+                        }
+                    }
+                }
+                crate::network::NetworkPacket::PrivateMessage { from, to, message, timestamp } => {
+                    if let Some(info) = clients_guard.get(&addr) {
+                        if info.is_authenticated && &info.username == from {
+                            // Store in DB
+                            {
+                                let db_lock = db.lock().unwrap();
+                                let _ = db_lock.execute(
+                                    "INSERT INTO private_messages (sender, recipient, message, timestamp) VALUES (?1, ?2, ?3, ?4)",
+                                    params![from, to, message, timestamp],
+                                );
+                            }
+
+                            // Relay to recipient if online
+                            let recipient_addr = clients_guard.iter()
+                                .find(|(_, info)| &info.username == to)
+                                .map(|(&addr, _)| addr);
+
+                            if let Some(target_addr) = recipient_addr {
+                                let _ = socket.send_to(&buf[..len], target_addr).await;
+                            }
+                        }
+                    }
+                }
+                crate::network::NetworkPacket::RequestDirectHistory { target } => {
+                    if let Some(info) = clients_guard.get(&addr) {
+                        if info.is_authenticated {
+                            let me = info.username.clone();
+                            let history: Vec<crate::network::NetworkPacket> = {
+                                let db_lock = db.lock().unwrap();
+                                let mut stmt = db_lock.prepare(
+                                    "SELECT sender, recipient, message, timestamp FROM private_messages 
+                                     WHERE (sender = ?1 AND recipient = ?2) OR (sender = ?2 AND recipient = ?1)
+                                     ORDER BY id DESC LIMIT 50"
+                                ).unwrap();
+                                
+                                let rows = stmt.query_map(params![me, target], |row| {
+                                    Ok(crate::network::NetworkPacket::PrivateMessage {
+                                        from: row.get(0)?,
+                                        to: row.get(1)?,
+                                        message: row.get::<_, Vec<u8>>(2)?,
+                                        timestamp: row.get(3)?,
+                                    })
+                                }).unwrap();
+
+                                let mut msgs: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+                                msgs.reverse();
+                                msgs
+                            };
+
+                            let response = crate::network::NetworkPacket::DirectHistory(history);
+                            if let Ok(encoded) = bincode::serialize(&response) {
+                                let _ = socket.send_to(&encoded, addr).await;
                             }
                         }
                     }

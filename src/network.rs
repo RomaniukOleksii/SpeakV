@@ -47,6 +47,9 @@ pub enum NetworkPacket {
     AdminAction { target: String, action: AdminActionType },
     UpdateProfile { status: String, nick_color: String },
     NetworkError(String),
+    PrivateMessage { from: String, to: String, message: Vec<u8>, timestamp: String },
+    RequestDirectHistory { target: String },
+    DirectHistory(Vec<NetworkPacket>),
 }
 
 // Re-add imports needed for the rest of the file

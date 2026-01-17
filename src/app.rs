@@ -99,6 +99,8 @@ pub struct SpeakVApp {
     status_input: String,
     nick_color_input: String,
     error_message: Option<String>,
+    selected_dm_target: Option<String>,
+    direct_messages: HashMap<String, Vec<ChatMessage>>,
 }
 
 impl SpeakVApp {
@@ -186,6 +188,8 @@ impl SpeakVApp {
             status_input: String::new(),
             nick_color_input: "#FFFFFF".to_string(),
             error_message: None,
+            selected_dm_target: None,
+            direct_messages: HashMap::new(),
         };
 
         // Auto-connect
@@ -416,6 +420,37 @@ impl eframe::App for SpeakVApp {
                         self.typing_users.insert(username, Instant::now());
                     } else {
                         self.typing_users.remove(&username);
+                    }
+                } else if let crate::network::NetworkPacket::PrivateMessage { from, to, message, timestamp } = packet {
+                    let decrypted_msg = crate::network::decrypt_bytes(&message)
+                        .and_then(|b| String::from_utf8(b).ok())
+                        .unwrap_or_else(|| "[Decryption Failed]".to_string());
+
+                    let other = if from == self.username { to } else { from };
+                    self.direct_messages.entry(other.clone()).or_default().push(ChatMessage {
+                        username: other,
+                        message: decrypted_msg,
+                        timestamp,
+                    });
+                    play_notification_beep();
+                } else if let crate::network::NetworkPacket::DirectHistory(history) = packet {
+                    if let Some(target) = &self.selected_dm_target {
+                        let msgs = self.direct_messages.entry(target.clone()).or_default();
+                        msgs.clear();
+                        for p in history {
+                            if let crate::network::NetworkPacket::PrivateMessage { from, to, message, timestamp } = p {
+                                let decrypted_msg = crate::network::decrypt_bytes(&message)
+                                    .and_then(|b| String::from_utf8(b).ok())
+                                    .unwrap_or_else(|| "[Decryption Failed]".to_string());
+                                
+                                let display_name = if from == self.username { "You".to_string() } else { from };
+                                msgs.push(ChatMessage {
+                                    username: display_name,
+                                    message: decrypted_msg,
+                                    timestamp,
+                                });
+                            }
+                        }
                     }
                 } else if let crate::network::NetworkPacket::ChatHistory(history) = packet {
                     self.chat_messages.clear(); // Clear existing messages before adding history
@@ -765,6 +800,22 @@ impl eframe::App for SpeakVApp {
                                         if !user.status.is_empty() {
                                             ui.label(egui::RichText::new(format!("({})", user.status)).size(10.0).color(egui::Color32::GRAY));
                                         }
+
+                                        // Mixer & DM buttons
+                                        if !is_me {
+                                            ui.add_space(5.0);
+                                            // DM Button
+                                            if ui.button("✉").on_hover_text("Send Private Message").clicked() {
+                                                self.selected_dm_target = Some(user.name.clone());
+                                                // Request history if not loaded? Or just always request.
+                                                let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::RequestDirectHistory { target: user.name.clone() });
+                                            }
+
+                                            // Volume Slider
+                                            let mut volumes = self.user_volumes.lock().unwrap();
+                                            let vol = volumes.entry(user.name.clone()).or_insert(1.0);
+                                            ui.add(egui::Slider::new(vol, 0.0..=2.0).show_value(false).text("🔊"));
+                                        }
                                         
                                         // Admin context menu
                                         if self.role == "Admin" && user.name != self.username {
@@ -811,6 +862,25 @@ impl eframe::App for SpeakVApp {
 
                     if let Some(idx) = channel_to_join {
                         self.current_channel_index = Some(idx);
+                    }
+
+                    ui.add_space(20.0);
+                    ui.separator();
+                    ui.heading(egui::RichText::new("Direct Messages").color(egui::Color32::WHITE));
+                    
+                    let mut dms_to_show: Vec<String> = self.direct_messages.keys().cloned().collect();
+                    dms_to_show.sort();
+                    
+                    if dms_to_show.is_empty() {
+                        ui.label(egui::RichText::new("No active DMs").small().color(egui::Color32::GRAY));
+                    } else {
+                        for other in dms_to_show {
+                            let is_current = self.selected_dm_target.as_ref() == Some(&other);
+                            if ui.selectable_label(is_current, format!("✉ {}", other)).clicked() {
+                                self.selected_dm_target = Some(other.clone());
+                                let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::RequestDirectHistory { target: other });
+                            }
+                        }
                     }
                 });
             });
@@ -908,6 +978,23 @@ impl eframe::App for SpeakVApp {
                     } else {
                         // Chat tab
                         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                            let chat_title = if let Some(target) = &self.selected_dm_target {
+                                format!("Private Chat with {}", target)
+                            } else if let Some(idx) = self.current_channel_index {
+                                format!("Channel: {}", self.channels[idx].name)
+                            } else {
+                                "Chat".to_string()
+                            };
+
+                            ui.horizontal(|ui| {
+                                ui.heading(egui::RichText::new(chat_title).size(16.0).strong());
+                                if self.selected_dm_target.is_some() {
+                                    if ui.button("❌ Close DM").clicked() {
+                                        self.selected_dm_target = None;
+                                    }
+                                }
+                            });
+                            ui.separator();
                             ui.add_space(10.0);
                             
                             // Chat input area
@@ -939,18 +1026,35 @@ impl eframe::App for SpeakVApp {
                                         };
                                         
                                         let encrypted = crate::network::encrypt_bytes(msg.message.as_bytes());
-                                        let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::ChatMessage {
-                                            username: msg.username.clone(),
-                                            message: encrypted,
-                                            timestamp: msg.timestamp.clone(),
-                                        });
+                                        
+                                        if let Some(target) = &self.selected_dm_target {
+                                            let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::PrivateMessage {
+                                                from: self.username.clone(),
+                                                to: target.clone(),
+                                                message: encrypted,
+                                                timestamp: msg.timestamp.clone(),
+                                            });
+                                            // Locally add to DM history
+                                            self.direct_messages.entry(target.clone()).or_default().push(ChatMessage {
+                                                username: "You".to_string(),
+                                                message: self.chat_input.clone(),
+                                                timestamp: msg.timestamp.clone(),
+                                            });
+                                        } else {
+                                            let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::ChatMessage {
+                                                username: msg.username.clone(),
+                                                message: encrypted,
+                                                timestamp: msg.timestamp.clone(),
+                                            });
+                                            // Locally add to chat history
+                                            self.chat_messages.push(msg);
+                                        }
 
                                         let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::TypingStatus {
                                             username: self.username.clone(),
                                             is_typing: false,
                                         });
 
-                                        self.chat_messages.push(msg);
                                         self.chat_input.clear();
                                     }
                                 }
@@ -977,7 +1081,13 @@ impl eframe::App for SpeakVApp {
                                 .stick_to_bottom(true)
                                 .show(ui, |ui| {
                                     ui.vertical(|ui| {
-                                        for msg in &self.chat_messages {
+                                        let messages = if let Some(target) = &self.selected_dm_target {
+                                            self.direct_messages.get(target).map(|v| v.as_slice()).unwrap_or(&[])
+                                        } else {
+                                            &self.chat_messages
+                                        };
+
+                                        for msg in messages {
                                             ui.horizontal_wrapped(|ui| {
                                                 ui.label(egui::RichText::new(&msg.timestamp)
                                                     .size(10.0)
