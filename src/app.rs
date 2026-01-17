@@ -98,6 +98,7 @@ pub struct SpeakVApp {
     role: String,
     status_input: String,
     nick_color_input: String,
+    error_message: Option<String>,
 }
 
 impl SpeakVApp {
@@ -205,6 +206,7 @@ impl SpeakVApp {
             role: "User".to_string(),
             status_input: String::new(),
             nick_color_input: "#FFFFFF".to_string(),
+            error_message: None,
         };
 
         // Auto-connect
@@ -444,6 +446,9 @@ impl eframe::App for SpeakVApp {
                             }
                         }
                     }
+                } else if let crate::network::NetworkPacket::NetworkError(msg) = packet {
+                    self.error_message = Some(msg);
+                    self.is_connected = false;
                 } else if let crate::network::NetworkPacket::TypingStatus { username, is_typing } = packet {
                     if is_typing {
                         self.typing_users.insert(username, Instant::now());
@@ -1310,6 +1315,23 @@ impl eframe::App for SpeakVApp {
                         }
                         if ui.button("Cancel").clicked() {
                             self.show_create_channel_dialog = false;
+                        }
+                    });
+                });
+        }
+
+        // Error Popup
+        if let Some(msg) = self.error_message.clone() {
+            egui::Window::new("⚠️ Connection Error")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.label(egui::RichText::new(&msg).color(egui::Color32::LIGHT_RED));
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("OK").clicked() {
+                            self.error_message = None;
                         }
                     });
                 });

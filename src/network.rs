@@ -46,6 +46,7 @@ pub enum NetworkPacket {
     ChatHistory(Vec<NetworkPacket>), // Should contain ChatMessage variants
     AdminAction { target: String, action: AdminActionType },
     UpdateProfile { status: String, nick_color: String },
+    NetworkError(String),
 }
 
 // Re-add imports needed for the rest of the file
@@ -116,7 +117,9 @@ impl NetworkManager {
             let addr: SocketAddr = match addr_str.parse() {
                 Ok(a) => a,
                 Err(_) => {
-                    eprintln!("Network: Invalid address {}", addr_str);
+                    let msg = format!("Invalid address: {}", addr_str);
+                    let _ = incoming_chat_tx.send(NetworkPacket::NetworkError(msg.clone()));
+                    eprintln!("Network: {}", msg);
                     return;
                 }
             };
@@ -124,13 +127,17 @@ impl NetworkManager {
             let socket = match UdpSocket::bind("0.0.0.0:0").await {
                 Ok(s) => Arc::new(s),
                 Err(e) => {
-                    eprintln!("Network: Failed to bind socket: {}", e);
+                    let msg = format!("Failed to bind socket: {}", e);
+                    let _ = incoming_chat_tx.send(NetworkPacket::NetworkError(msg.clone()));
+                    eprintln!("Network: {}", msg);
                     return;
                 }
             };
 
             if let Err(e) = socket.connect(addr).await {
-                eprintln!("Network: Failed to connect to {}: {}", addr, e);
+                let msg = format!("Failed to connect to {}: {}", addr, e);
+                let _ = incoming_chat_tx.send(NetworkPacket::NetworkError(msg.clone()));
+                eprintln!("Network: {}", msg);
                 return;
             }
 
