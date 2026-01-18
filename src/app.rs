@@ -138,7 +138,7 @@ pub struct SpeakVApp {
     dark_mode: bool,
     search_query: String,
     
-    // v0.9.0 Identity & Audio
+    // v0.9.0.1 Identity & Audio (Stabilizer Update)
     remote_user_levels: Arc<Mutex<HashMap<String, f32>>>,
     show_profile_card: Option<String>,
     user_profiles: HashMap<String, UserProfile>,
@@ -250,7 +250,7 @@ impl SpeakVApp {
             dark_mode: true,
             search_query: String::new(),
 
-            // v0.9.0
+            // v0.9.0.1
             remote_user_levels,
             show_profile_card: None,
             user_profiles: HashMap::new(),
@@ -1762,7 +1762,8 @@ impl eframe::App for SpeakVApp {
                 .default_width(400.0)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
-                    ui.heading("Audio Settings");
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.heading("Audio Settings");
                     ui.separator();
                     
                     egui::Grid::new("settings_grid")
@@ -1922,6 +1923,7 @@ impl eframe::App for SpeakVApp {
                         });
                     });
                 });
+            });
         }
 
         // Create Channel Dialog
