@@ -1102,6 +1102,7 @@ impl eframe::App for SpeakVApp {
                                         .desired_width(ui.available_width() - 100.0) // Adjusted for 📎 button
                                 );
                                 
+                                if ui.button("📎").on_hover_text("Send a file or photo").clicked() {
                                     if let Some(path) = FileDialog::new()
                                         .add_filter("Images/Files", &["png", "jpg", "jpeg", "gif", "txt", "pdf", "zip"])
                                         .pick_file() 
@@ -1159,6 +1160,7 @@ impl eframe::App for SpeakVApp {
                                             }
                                         }
                                     }
+                                }
                                 
                                 if response.changed() {
                                     if self.last_typing_sent.elapsed().as_secs_f32() > 0.5 {
