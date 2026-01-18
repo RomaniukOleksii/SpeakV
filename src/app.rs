@@ -144,6 +144,8 @@ pub struct SpeakVApp {
     user_profiles: HashMap<String, UserProfile>,
     avatar_url_input: String,
     bio_input: String,
+    // v0.9.2 UI Refinement
+    chat_font_size: f32,
 }
 
 impl SpeakVApp {
@@ -256,6 +258,7 @@ impl SpeakVApp {
             user_profiles: HashMap::new(),
             avatar_url_input: String::new(),
             bio_input: String::new(),
+            chat_font_size: 14.0,
         };
 
         // Auto-connect and auto-login if remember_me is true
@@ -407,7 +410,7 @@ impl SpeakVApp {
                 if current.starts_with("**") {
                     if let Some(end) = current[2..].find("**") {
                         let inner = &current[2..2+end];
-                        ui.label(egui::RichText::new(inner).strong());
+                        ui.label(egui::RichText::new(inner).strong().size(self.chat_font_size));
                         current = &current[2+end+2..];
                         continue;
                     }
@@ -415,7 +418,7 @@ impl SpeakVApp {
                 if current.starts_with("*") {
                     if let Some(end) = current[1..].find("*") {
                         let inner = &current[1..1+end];
-                        ui.label(egui::RichText::new(inner).italics());
+                        ui.label(egui::RichText::new(inner).italics().size(self.chat_font_size));
                         current = &current[1+end+1..];
                         continue;
                     }
@@ -426,6 +429,7 @@ impl SpeakVApp {
                         ui.add(egui::Label::new(
                             egui::RichText::new(inner)
                                 .monospace()
+                                .size(self.chat_font_size)
                                 .background_color(ui.visuals().code_bg_color)
                         ));
                         current = &current[1+end+1..];
@@ -436,7 +440,7 @@ impl SpeakVApp {
                     .filter_map(|t| current[1..].find(*t).map(|i| i + 1))
                     .min()
                     .unwrap_or(current.len());
-                ui.label(&current[..next_trigger]);
+                ui.label(egui::RichText::new(&current[..next_trigger]).size(self.chat_font_size));
                 current = &current[next_trigger..];
             }
         });
@@ -1760,10 +1764,13 @@ impl eframe::App for SpeakVApp {
                 .collapsible(false)
                 .resizable(true)
                 .default_width(400.0)
+                .max_height(500.0)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.heading("Audio Settings");
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.heading("Audio Settings");
                     ui.separator();
                     
                     egui::Grid::new("settings_grid")
@@ -1847,6 +1854,10 @@ impl eframe::App for SpeakVApp {
                             
                             ui.label("Profile Bio:");
                             ui.add(egui::TextEdit::multiline(&mut self.bio_input).hint_text("Tell us about yourself..."));
+                            ui.end_row();
+
+                            ui.label("Chat Font Size:");
+                            ui.add(egui::Slider::new(&mut self.chat_font_size, 10.0..=30.0).text("px"));
                             ui.end_row();
                             
                             ui.label("");
