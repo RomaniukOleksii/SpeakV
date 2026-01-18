@@ -55,7 +55,7 @@ pub async fn run_server() -> anyhow::Result<()> {
 
     // Initialize Database
     let db_conn = Connection::open("users.db")?;
-    db_conn.execute(
+    db_conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY,
             username TEXT UNIQUE NOT NULL,
@@ -64,47 +64,41 @@ pub async fn run_server() -> anyhow::Result<()> {
             is_banned INTEGER DEFAULT 0,
             status TEXT DEFAULT '',
             nick_color TEXT DEFAULT '#FFFFFF'
-        )",
-        [],
-    )?;
-    db_conn.execute(
-        "CREATE TABLE IF NOT EXISTS chat_messages (
-            id INTEGER PRIMARY KEY,
+        );
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            msg_id TEXT NOT NULL,
             username TEXT NOT NULL,
             channel TEXT NOT NULL,
             message BLOB NOT NULL,
             timestamp TEXT NOT NULL
-        )",
-        [],
-    )?;
-    db_conn.execute(
-        "CREATE TABLE IF NOT EXISTS channels (
+        );
+        CREATE TABLE IF NOT EXISTS channels (
             name TEXT PRIMARY KEY NOT NULL
-        )",
-        [],
-    )?;
-    db_conn.execute(
-        "CREATE TABLE IF NOT EXISTS private_messages (
-            id INTEGER PRIMARY KEY,
+        );
+        CREATE TABLE IF NOT EXISTS private_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            msg_id TEXT NOT NULL,
             sender TEXT NOT NULL,
             recipient TEXT NOT NULL,
             message BLOB NOT NULL,
             timestamp TEXT NOT NULL
-        )",
-        [],
-    )?;
-    db_conn.execute(
-        "CREATE TABLE IF NOT EXISTS file_messages (
-            id INTEGER PRIMARY KEY,
-            username TEXT NOT NULL,
+        );
+        CREATE TABLE IF NOT EXISTS file_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            msg_id TEXT NOT NULL,
             channel TEXT NOT NULL,
             recipient TEXT, -- NULL for channel files
             filename TEXT NOT NULL,
             data BLOB NOT NULL,
             is_image INTEGER NOT NULL,
             timestamp TEXT NOT NULL
-        )",
-        [],
+        );
+        CREATE TABLE IF NOT EXISTS reactions (
+            msg_id TEXT NOT NULL,
+            username TEXT NOT NULL,
+            emoji TEXT NOT NULL
+        );"
     )?;
     
     // Default channels
@@ -265,7 +259,7 @@ pub async fn run_server() -> anyhow::Result<()> {
                         }
                     }
                 }
-                crate::network::NetworkPacket::ChatMessage { username, message, timestamp } => {
+                crate::network::NetworkPacket::ChatMessage { id, username, message, timestamp } => {
                     let (sender_channel, authenticated, is_muted) = if let Some(info) = clients_guard.get_mut(&addr) {
                         info.last_seen = tokio::time::Instant::now();
                         (info.current_channel.clone(), info.is_authenticated, info.is_muted)
@@ -278,8 +272,8 @@ pub async fn run_server() -> anyhow::Result<()> {
                         {
                             let db_lock = db.lock().unwrap();
                             let _ = db_lock.execute(
-                                "INSERT INTO chat_messages (username, channel, message, timestamp) VALUES (?1, ?2, ?3, ?4)",
-                                params![username, sender_channel, message, timestamp],
+                                "INSERT INTO chat_messages (msg_id, username, channel, message, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
+                                params![id.to_string(), username, sender_channel, message, timestamp],
                             );
                         }
 
@@ -343,15 +337,17 @@ pub async fn run_server() -> anyhow::Result<()> {
                             let history: Vec<crate::network::NetworkPacket> = {
                                 let db_lock = db.lock().unwrap();
                                 let mut stmt = db_lock.prepare(
-                                    "SELECT username, message, timestamp FROM chat_messages 
+                                    "SELECT msg_id, username, message, timestamp FROM chat_messages 
                                      WHERE channel = ?1 ORDER BY id DESC LIMIT 50"
                                 ).unwrap();
                                 
                                 let rows = stmt.query_map(params![channel], |row| {
+                                    let msg_id_str: String = row.get(0)?;
                                     Ok(crate::network::NetworkPacket::ChatMessage {
-                                        username: row.get(0)?,
-                                        message: row.get::<_, Vec<u8>>(1)?,
-                                        timestamp: row.get(2)?,
+                                        id: uuid::Uuid::parse_str(&msg_id_str).unwrap_or_default(),
+                                        username: row.get(1)?,
+                                        message: row.get::<_, Vec<u8>>(2)?,
+                                        timestamp: row.get(3)?,
                                     })
                                 }).unwrap();
                                 
@@ -360,23 +356,42 @@ pub async fn run_server() -> anyhow::Result<()> {
 
                                 // Fetch file messages for this channel
                                 let mut stmt_files = db_lock.prepare(
-                                    "SELECT username, filename, data, is_image, timestamp FROM file_messages 
+                                    "SELECT msg_id, username, filename, data, is_image, timestamp FROM file_messages 
                                      WHERE channel = ?1 AND recipient IS NULL ORDER BY id DESC LIMIT 50"
                                 ).unwrap();
                                 let file_rows = stmt_files.query_map(params![channel], |row| {
+                                    let msg_id_str: String = row.get(0)?;
                                     Ok(crate::network::NetworkPacket::FileMessage {
-                                        from: row.get(0)?,
+                                        id: uuid::Uuid::parse_str(&msg_id_str).unwrap_or_default(),
+                                        from: row.get(1)?,
                                         to: None,
-                                        filename: row.get(1)?,
-                                        data: row.get::<_, Vec<u8>>(2)?,
-                                        is_image: row.get::<_, i32>(3)? == 1,
-                                        timestamp: row.get(4)?,
+                                        filename: row.get(2)?,
+                                        data: row.get::<_, Vec<u8>>(3)?,
+                                        is_image: row.get::<_, i32>(4)? == 1,
+                                        timestamp: row.get(5)?,
                                     })
                                 }).unwrap();
                                 for r in file_rows { if let Ok(p) = r { final_history.push(p); } }
                                 
-                                // Sort combined by timestamp? Or just leave it as is for now.
-                                // Actually, it's better to sort.
+                                // Fetch reactions and add them as separate packets or attach to messages?
+                                // Protocol wise, maybe it's better to add a ReactionsHistory variant?
+                                // Actually, let's just append all relevant reactions to the history too.
+                                let mut stmt_react = db_lock.prepare(
+                                    "SELECT msg_id, username, emoji FROM reactions 
+                                     WHERE msg_id IN (SELECT msg_id FROM chat_messages WHERE channel = ?1)
+                                     OR msg_id IN (SELECT msg_id FROM file_messages WHERE channel = ?1)"
+                                ).unwrap();
+                                let react_rows = stmt_react.query_map(params![channel], |row| {
+                                    let msg_id_str: String = row.get(0)?;
+                                    Ok(crate::network::NetworkPacket::Reaction {
+                                        msg_id: uuid::Uuid::parse_str(&msg_id_str).unwrap_or_default(),
+                                        from: row.get(1)?,
+                                        emoji: row.get(2)?,
+                                    })
+                                }).unwrap();
+                                for r in react_rows { if let Ok(p) = r { final_history.push(p); } }
+
+                                // Sort combined by timestamp
                                 final_history.sort_by(|a, b| {
                                     let get_ts = |p: &crate::network::NetworkPacket| match p {
                                         crate::network::NetworkPacket::ChatMessage { timestamp, .. } => timestamp.clone(),
@@ -425,15 +440,15 @@ pub async fn run_server() -> anyhow::Result<()> {
                         }
                     }
                 }
-                crate::network::NetworkPacket::PrivateMessage { from, to, message, timestamp } => {
+                crate::network::NetworkPacket::PrivateMessage { id, from, to, message, timestamp } => {
                     if let Some(info) = clients_guard.get(&addr) {
                         if info.is_authenticated && &info.username == from {
                             // Store in DB
                             {
                                 let db_lock = db.lock().unwrap();
                                 let _ = db_lock.execute(
-                                    "INSERT INTO private_messages (sender, recipient, message, timestamp) VALUES (?1, ?2, ?3, ?4)",
-                                    params![from, to, message, timestamp],
+                                    "INSERT INTO private_messages (msg_id, sender, recipient, message, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
+                                    params![id.to_string(), from, to, message, timestamp],
                                 );
                             }
 
@@ -455,17 +470,19 @@ pub async fn run_server() -> anyhow::Result<()> {
                             let history: Vec<crate::network::NetworkPacket> = {
                                 let db_lock = db.lock().unwrap();
                                 let mut stmt = db_lock.prepare(
-                                    "SELECT sender, recipient, message, timestamp FROM private_messages 
+                                    "SELECT msg_id, sender, recipient, message, timestamp FROM private_messages 
                                      WHERE (sender = ?1 AND recipient = ?2) OR (sender = ?2 AND recipient = ?1)
                                      ORDER BY id DESC LIMIT 50"
                                 ).unwrap();
                                 
                                 let rows = stmt.query_map(params![me, target], |row| {
+                                    let msg_id_str: String = row.get(0)?;
                                     Ok(crate::network::NetworkPacket::PrivateMessage {
-                                        from: row.get(0)?,
-                                        to: row.get(1)?,
-                                        message: row.get::<_, Vec<u8>>(2)?,
-                                        timestamp: row.get(3)?,
+                                        id: uuid::Uuid::parse_str(&msg_id_str).unwrap_or_default(),
+                                        from: row.get(1)?,
+                                        to: row.get(2)?,
+                                        message: row.get::<_, Vec<u8>>(3)?,
+                                        timestamp: row.get(4)?,
                                     })
                                 }).unwrap();
                                 
@@ -474,21 +491,39 @@ pub async fn run_server() -> anyhow::Result<()> {
 
                                 // Fetch file messages for this DM
                                 let mut stmt_files = db_lock.prepare(
-                                    "SELECT username, recipient, filename, data, is_image, timestamp FROM file_messages 
+                                    "SELECT msg_id, username, recipient, filename, data, is_image, timestamp FROM file_messages 
                                      WHERE (username = ?1 AND recipient = ?2) OR (username = ?2 AND recipient = ?1)
                                      ORDER BY id DESC LIMIT 50"
                                 ).unwrap();
                                 let file_rows = stmt_files.query_map(params![me, target], |row| {
+                                    let msg_id_str: String = row.get(0)?;
                                     Ok(crate::network::NetworkPacket::FileMessage {
-                                        from: row.get(0)?,
-                                        to: Some(row.get(1)?),
-                                        filename: row.get(2)?,
-                                        data: row.get::<_, Vec<u8>>(3)?,
-                                        is_image: row.get::<_, i32>(4)? == 1,
-                                        timestamp: row.get(5)?,
+                                        id: uuid::Uuid::parse_str(&msg_id_str).unwrap_or_default(),
+                                        from: row.get(1)?,
+                                        to: Some(row.get(2)?),
+                                        filename: row.get(3)?,
+                                        data: row.get::<_, Vec<u8>>(4)?,
+                                        is_image: row.get::<_, i32>(5)? == 1,
+                                        timestamp: row.get(6)?,
                                     })
                                 }).unwrap();
                                 for r in file_rows { if let Ok(p) = r { final_history.push(p); } }
+
+                                // Fetch reactions for DM
+                                let mut stmt_react = db_lock.prepare(
+                                    "SELECT msg_id, username, emoji FROM reactions 
+                                     WHERE msg_id IN (SELECT msg_id FROM private_messages WHERE (sender = ?1 AND recipient = ?2) OR (sender = ?2 AND recipient = ?1))
+                                     OR msg_id IN (SELECT msg_id FROM file_messages WHERE (username = ?1 AND recipient = ?2) OR (username = ?2 AND recipient = ?1))"
+                                ).unwrap();
+                                let react_rows = stmt_react.query_map(params![me, target], |row| {
+                                    let msg_id_str: String = row.get(0)?;
+                                    Ok(crate::network::NetworkPacket::Reaction {
+                                        msg_id: uuid::Uuid::parse_str(&msg_id_str).unwrap_or_default(),
+                                        from: row.get(1)?,
+                                        emoji: row.get(2)?,
+                                    })
+                                }).unwrap();
+                                for r in react_rows { if let Ok(p) = r { final_history.push(p); } }
                                 
                                 final_history.sort_by(|a, b| {
                                     let get_ts = |p: &crate::network::NetworkPacket| match p {
@@ -555,11 +590,9 @@ pub async fn run_server() -> anyhow::Result<()> {
                      // Relay first
                      let mut sender_channel = "Lobby".to_string();
                      let mut authenticated = false;
-                     let mut from_user = String::new();
                      if let Some(info) = clients_guard.get(&addr) {
                          sender_channel = info.current_channel.clone();
                          authenticated = info.is_authenticated;
-                         from_user = info.username.clone();
                      }
                      
                      if authenticated {
@@ -592,14 +625,33 @@ pub async fn run_server() -> anyhow::Result<()> {
                                     
                                     let db_lock = db.lock().unwrap();
                                     let _ = db_lock.execute(
-                                        "INSERT INTO file_messages (username, channel, recipient, filename, data, is_image, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                                        params![from, channel, recipient, filename, full_data, if is_image { 1 } else { 0 }, timestamp],
+                                        "INSERT INTO file_messages (msg_id, username, channel, recipient, filename, data, is_image, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                                        params![id.to_string(), from, channel, recipient, filename, full_data, if is_image { 1 } else { 0 }, timestamp],
                                     );
                                     reassemblers.remove(&id);
                                 }
                             }
                         }
                      }
+                }
+                crate::network::NetworkPacket::Reaction { msg_id, emoji, from } => {
+                    if let Some(info) = clients_guard.get(&addr) {
+                        if info.is_authenticated && &info.username == from {
+                            // Store in DB
+                            {
+                                let db_lock = db.lock().unwrap();
+                                let _ = db_lock.execute(
+                                    "INSERT INTO reactions (msg_id, username, emoji) VALUES (?1, ?2, ?3)",
+                                    params![msg_id.to_string(), from, emoji],
+                                );
+                            }
+
+                            // Broadcast to all relevant clients
+                            for &client_addr in clients_guard.keys() {
+                                let _ = socket.send_to(&buf[..len], client_addr).await;
+                            }
+                        }
+                    }
                 }
                 crate::network::NetworkPacket::Ping => {
                     if let Some(info) = clients_guard.get_mut(&addr) {

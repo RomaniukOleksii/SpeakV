@@ -3,12 +3,11 @@ use crate::audio::AudioManager;
 use crate::network::NetworkManager;
 use crate::updater::{UpdateManager, UpdateStatus};
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use std::sync::{Arc, Mutex};
-use std::net::SocketAddr;
 use std::fs;
 use rfd::FileDialog;
-use image::GenericImageView;
+use image;
 use rodio::Source;
 
 struct User {
@@ -35,11 +34,13 @@ enum InputMode {
 }
 
 #[derive(Clone)]
-struct ChatMessage {
-    username: String,
-    message: String,
-    timestamp: String,
-    file_data: Option<(String, Vec<u8>, bool)>, // filename, data, is_image
+pub struct ChatMessage {
+    pub id: uuid::Uuid,
+    pub username: String,
+    pub message: String,
+    pub timestamp: String,
+    pub file_data: Option<(String, Vec<u8>, bool)>, // filename, data, is_image
+    pub reactions: HashMap<String, Vec<String>>, // Emoji -> Vec of Users
 }
 
 pub struct PendingFile {
@@ -118,6 +119,8 @@ pub struct SpeakVApp {
     direct_messages: HashMap<String, Vec<ChatMessage>>,
     image_cache: HashMap<String, egui::TextureHandle>,
     pending_files: HashMap<uuid::Uuid, PendingFile>,
+    dark_mode: bool,
+    search_query: String,
 }
 
 impl SpeakVApp {
@@ -156,7 +159,7 @@ impl SpeakVApp {
 
         let user_volumes = if let Some(net) = &network_manager { net.user_volumes.clone() } else { Arc::new(Mutex::new(HashMap::new())) };
 
-        let mut app = Self {
+        let app = Self {
             audio_manager,
             network_manager,
             update_manager: UpdateManager::new(),
@@ -209,6 +212,8 @@ impl SpeakVApp {
             direct_messages: HashMap::new(),
             image_cache: HashMap::new(),
             pending_files: HashMap::new(),
+            dark_mode: true,
+            search_query: String::new(),
         };
 
         // Auto-connect
@@ -319,6 +324,49 @@ impl SpeakVApp {
             }
         }
     }
+
+    fn render_markdown_text(&self, ui: &mut egui::Ui, text: &str) {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let mut current = text;
+            while !current.is_empty() {
+                if current.starts_with("**") {
+                    if let Some(end) = current[2..].find("**") {
+                        let inner = &current[2..2+end];
+                        ui.label(egui::RichText::new(inner).strong());
+                        current = &current[2+end+2..];
+                        continue;
+                    }
+                }
+                if current.starts_with("*") {
+                    if let Some(end) = current[1..].find("*") {
+                        let inner = &current[1..1+end];
+                        ui.label(egui::RichText::new(inner).italics());
+                        current = &current[1+end+1..];
+                        continue;
+                    }
+                }
+                if current.starts_with("`") {
+                    if let Some(end) = current[1..].find("`") {
+                        let inner = &current[1..1+end];
+                        ui.add(egui::Label::new(
+                            egui::RichText::new(inner)
+                                .monospace()
+                                .background_color(ui.visuals().code_bg_color)
+                        ));
+                        current = &current[1+end+1..];
+                        continue;
+                    }
+                }
+                let next_trigger = ["**", "*", "`"].iter()
+                    .filter_map(|t| current[1..].find(*t).map(|i| i + 1))
+                    .min()
+                    .unwrap_or(current.len());
+                ui.label(&current[..next_trigger]);
+                current = &current[next_trigger..];
+            }
+        });
+    }
 }
 
 fn play_notification_beep() {
@@ -346,224 +394,299 @@ fn hex_to_color(hex: &str) -> Result<egui::Color32, ()> {
 
 impl eframe::App for SpeakVApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.dark_mode {
+            ctx.set_visuals(egui::Visuals::dark());
+        } else {
+            ctx.set_visuals(egui::Visuals::light());
+        }
+
+        // Process incoming packets
         // Handle incoming network chat messages
         if let Some(net) = &self.network_manager {
             self.is_connected = *net.is_connected.lock().unwrap();
             while let Ok(packet) = self.incoming_chat_rx.try_recv() {
-                if let crate::network::NetworkPacket::ChatMessage { username, message, timestamp } = packet {
-                    let decrypted_msg = crate::network::decrypt_bytes(&message)
-                        .and_then(|b| String::from_utf8(b).ok())
-                        .unwrap_or_else(|| "[Decryption Failed]".to_string());
+                match packet {
+                    crate::network::NetworkPacket::ChatMessage { id, username, message, timestamp } => {
+                        let decrypted_msg = crate::network::decrypt_bytes(&message)
+                            .and_then(|b| String::from_utf8(b).ok())
+                            .unwrap_or_else(|| "[Decryption Failed]".to_string());
 
-                    self.chat_messages.push(ChatMessage {
-                        username: username.clone(),
-                        message: decrypted_msg,
-                        timestamp,
-                        file_data: None,
-                    });
-                    if username != self.username {
-                        play_notification_beep();
-                    }
-                } else if let crate::network::NetworkPacket::AuthResponse { success, message, role, status, nick_color } = packet {
-                    self.is_authenticated = success;
-                    self.auth_message = message;
-                    if success {
-                        self.username = self.login_input.clone();
-                        if let Some(r) = role {
-                            self.role = r;
-                        }
-                        if let Some(s) = status {
-                            self.status_input = s;
-                        }
-                        if let Some(c) = nick_color {
-                            self.nick_color_input = c;
-                        }
-                        self.save_username();
-                    }
-                } else if let crate::network::NetworkPacket::UsersUpdate(chan_state) = packet {
-                    // Update participants (flat list)
-                    self.participants.clear();
-                    for (_chan_name, users) in &chan_state {
-                        for user_info in users {
-                            if !self.participants.contains(&user_info.username) {
-                                self.participants.push(user_info.username.clone());
-                            }
-                        }
-                    }
-
-                    // Rebuild channels list while preserving expansion state
-                    let mut new_channels = Vec::new();
-                    for (chan_name, users) in chan_state {
-                        let expanded = self.channels.iter()
-                            .find(|c| c.name == chan_name)
-                            .map(|c| c.expanded)
-                            .unwrap_or(true);
-                        
-                        let mut user_list = Vec::new();
-                        for user_info in users {
-                            user_list.push(User {
-                                name: user_info.username.clone(),
-                                is_speaking: self.speaking_users.contains_key(&user_info.username),
-                                is_muted: user_info.is_muted,
-                                is_deafened: false,
-                                is_away: false,
-                                role: user_info.role,
-                                status: user_info.status,
-                                nick_color: user_info.nick_color,
-                            });
-                        }
-
-                        new_channels.push(Channel {
-                            name: chan_name,
-                            users: user_list,
-                            expanded,
+                        self.chat_messages.push(ChatMessage {
+                            id,
+                            username: username.clone(),
+                            message: decrypted_msg,
+                            timestamp,
+                            file_data: None,
+                            reactions: HashMap::new(),
                         });
-                    }
-                    self.channels = new_channels;
-
-                    // Update current channel index
-                    if let Some(_net) = &self.network_manager {
-                        // We don't have a direct "current channel" from server in hand yet, 
-                        // but we can find where the current user is.
-                        for (idx, chan) in self.channels.iter().enumerate() {
-                            if chan.users.iter().any(|u| u.name == self.username) {
-                                self.current_channel_index = Some(idx);
-                                break;
-                            }
+                        if username != self.username {
+                            play_notification_beep();
                         }
                     }
-                } else if let crate::network::NetworkPacket::NetworkError(msg) = packet {
-                    self.error_message = Some(msg);
-                    self.is_connected = false;
-                } else if let crate::network::NetworkPacket::TypingStatus { username, is_typing } = packet {
-                    if is_typing {
-                        self.typing_users.insert(username, Instant::now());
-                    } else {
-                        self.typing_users.remove(&username);
+                    crate::network::NetworkPacket::AuthResponse { success, message, role, status, nick_color } => {
+                        self.is_authenticated = success;
+                        self.auth_message = message;
+                        if success {
+                            self.username = self.login_input.clone();
+                            if let Some(r) = role { self.role = r; }
+                            if let Some(s) = status { self.status_input = s; }
+                            if let Some(c) = nick_color { self.nick_color_input = c; }
+                            self.save_username();
+                        }
                     }
-                } else if let crate::network::NetworkPacket::PrivateMessage { from, to, message, timestamp } = packet {
-                    let decrypted_msg = crate::network::decrypt_bytes(&message)
-                        .and_then(|b| String::from_utf8(b).ok())
-                        .unwrap_or_else(|| "[Decryption Failed]".to_string());
+                    crate::network::NetworkPacket::UsersUpdate(chan_state) => {
+                        self.participants.clear();
+                        for (_chan_name, users) in &chan_state {
+                            for user_info in users {
+                                if !self.participants.contains(&user_info.username) {
+                                    self.participants.push(user_info.username.clone());
+                                }
+                            }
+                        }
 
-                    let other = if from == self.username { to.clone() } else { from.clone() };
-                    self.direct_messages.entry(other.clone()).or_default().push(ChatMessage {
-                        username: from,
-                        message: decrypted_msg,
-                        timestamp,
-                        file_data: None,
-                    });
-                    play_notification_beep();
-                } else if let crate::network::NetworkPacket::FileMessage { from, to, filename, data, is_image, timestamp } = packet {
-                    let other = if from == self.username { to.clone().unwrap_or_default() } else { from.clone() };
-                    self.direct_messages.entry(other.clone()).or_default().push(ChatMessage {
-                        username: from,
-                        message: format!("Sent a file: {}", filename),
-                        timestamp,
-                        file_data: Some((filename, data, is_image)),
-                    });
-                    play_notification_beep();
-                } else if let crate::network::NetworkPacket::DirectHistory(history) = packet {
-                    if let Some(target) = &self.selected_dm_target {
-                        let msgs = self.direct_messages.entry(target.clone()).or_default();
-                        msgs.clear();
-                        for p in history {
-                            if let crate::network::NetworkPacket::PrivateMessage { from, to, message, timestamp } = p {
-                                let decrypted_msg = crate::network::decrypt_bytes(&message)
-                                    .and_then(|b| String::from_utf8(b).ok())
-                                    .unwrap_or_else(|| "[Decryption Failed]".to_string());
-                                
-                                let display_name = if from == self.username { "You".to_string() } else { from };
-                               msgs.push(ChatMessage {
-                                    username: display_name,
-                                    message: decrypted_msg,
-                                    timestamp,
-                                    file_data: None,
+                        let mut new_channels = Vec::new();
+                        for (chan_name, users) in chan_state {
+                            let expanded = self.channels.iter()
+                                .find(|c| c.name == chan_name)
+                                .map(|c| c.expanded)
+                                .unwrap_or(true);
+                            
+                            let mut user_list = Vec::new();
+                            for user_info in users {
+                                user_list.push(User {
+                                    name: user_info.username.clone(),
+                                    is_speaking: self.speaking_users.contains_key(&user_info.username),
+                                    is_muted: user_info.is_muted,
+                                    is_deafened: false,
+                                    is_away: false,
+                                    role: user_info.role,
+                                    status: user_info.status,
+                                    nick_color: user_info.nick_color,
                                 });
                             }
+
+                            new_channels.push(Channel {
+                                name: chan_name,
+                                users: user_list,
+                                expanded,
+                            });
+                        }
+                        self.channels = new_channels;
+
+                        if let Some(_net) = &self.network_manager {
+                            for (idx, chan) in self.channels.iter().enumerate() {
+                                if chan.users.iter().any(|u| u.name == self.username) {
+                                    self.current_channel_index = Some(idx);
+                                    break;
+                                }
+                            }
                         }
                     }
-                } else if let crate::network::NetworkPacket::ChatHistory(history) = packet {
-                    self.chat_messages.clear(); // Clear existing messages before adding history
-                    for p in history {
-                        if let crate::network::NetworkPacket::ChatMessage { username, message, timestamp } = p {
-                            let decrypted_msg = crate::network::decrypt_bytes(&message)
-                                .and_then(|b| String::from_utf8(b).ok())
-                                .unwrap_or_else(|| "[Decryption Failed]".to_string());
+                    crate::network::NetworkPacket::NetworkError(msg) => {
+                        self.error_message = Some(msg);
+                        self.is_connected = false;
+                    }
+                    crate::network::NetworkPacket::TypingStatus { username, is_typing } => {
+                        if is_typing {
+                            self.typing_users.insert(username, Instant::now());
+                        } else {
+                            self.typing_users.remove(&username);
+                        }
+                    }
+                    crate::network::NetworkPacket::PrivateMessage { id, from, to, message, timestamp } => {
+                        let decrypted_msg = crate::network::decrypt_bytes(&message)
+                            .and_then(|b| String::from_utf8(b).ok())
+                            .unwrap_or_else(|| "[Decryption Failed]".to_string());
 
-                            self.chat_messages.push(ChatMessage {
-                                username,
-                                message: decrypted_msg,
-                                timestamp,
-                                file_data: None,
-                            });
-                        } else if let crate::network::NetworkPacket::FileMessage { from, to: _, filename, data, is_image, timestamp } = p {
-                            self.chat_messages.push(ChatMessage {
+                        let other = if from == self.username { to.clone() } else { from.clone() };
+                        self.direct_messages.entry(other.clone()).or_default().push(ChatMessage {
+                            id,
+                            username: from,
+                            message: decrypted_msg,
+                            timestamp,
+                            file_data: None,
+                            reactions: HashMap::new(),
+                        });
+                        play_notification_beep();
+                    }
+                    crate::network::NetworkPacket::FileMessage { id, from, to, filename, data, is_image, timestamp } => {
+                        let other = if from == self.username { to.clone().unwrap_or_default() } else { from.clone() };
+                        if !other.is_empty() {
+                            self.direct_messages.entry(other).or_default().push(ChatMessage {
+                                id,
                                 username: from,
                                 message: format!("Sent a file: {}", filename),
                                 timestamp,
                                 file_data: Some((filename, data, is_image)),
+                                reactions: HashMap::new(),
+                            });
+                        } else {
+                            self.chat_messages.push(ChatMessage {
+                                id,
+                                username: from,
+                                message: format!("Sent a file: {}", filename),
+                                timestamp,
+                                file_data: Some((filename, data, is_image)),
+                                reactions: HashMap::new(),
                             });
                         }
+                        play_notification_beep();
                     }
-                } else if let crate::network::NetworkPacket::FileStart { id, from, to, filename, total_chunks, is_image, timestamp } = packet {
-                    self.pending_files.insert(id, PendingFile {
-                        filename, from, to, is_image, timestamp,
-                        chunks: vec![None; total_chunks],
-                        total_chunks,
-                        received_count: 0,
-                    });
-                } else if let crate::network::NetworkPacket::FileChunk { id, chunk_index, data } = packet {
-                    if let Some(pending) = self.pending_files.get_mut(&id) {
-                        if chunk_index < pending.total_chunks && pending.chunks[chunk_index].is_none() {
-                            pending.chunks[chunk_index] = Some(data);
-                            pending.received_count += 1;
-                            
-                            if pending.received_count == pending.total_chunks {
-                                // Reassemble and finalize
-                                let mut full_data = Vec::new();
-                                for chunk in pending.chunks.drain(..) {
-                                    if let Some(c) = chunk { full_data.extend(c); }
+                    crate::network::NetworkPacket::DirectHistory(history) => {
+                        if let Some(target) = &self.selected_dm_target {
+                            let msgs = self.direct_messages.entry(target.clone()).or_default();
+                            msgs.clear();
+                            for p in history {
+                                match p {
+                                    crate::network::NetworkPacket::PrivateMessage { id, from, to: _, message, timestamp } => {
+                                        let decrypted_msg = crate::network::decrypt_bytes(&message)
+                                            .and_then(|b| String::from_utf8(b).ok())
+                                            .unwrap_or_else(|| "[Decryption Failed]".to_string());
+                                        let display_name = if from == self.username { "You".to_string() } else { from };
+                                        msgs.push(ChatMessage {
+                                            id,
+                                            username: display_name,
+                                            message: decrypted_msg,
+                                            timestamp,
+                                            file_data: None,
+                                            reactions: HashMap::new(),
+                                        });
+                                    }
+                                    crate::network::NetworkPacket::FileMessage { id, from, to: _, filename, data, is_image, timestamp } => {
+                                        let display_name = if from == self.username { "You".to_string() } else { from };
+                                        msgs.push(ChatMessage {
+                                            id,
+                                            username: display_name,
+                                            message: format!("Sent a file: {}", filename),
+                                            timestamp,
+                                            file_data: Some((filename, data, is_image)),
+                                            reactions: HashMap::new(),
+                                        });
+                                    }
+                                    crate::network::NetworkPacket::Reaction { msg_id, emoji, from } => {
+                                        for m in msgs.iter_mut() {
+                                            if m.id == msg_id {
+                                                m.reactions.entry(emoji.clone()).or_default().push(from.clone());
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
                                 }
-                                
-                                let from = pending.from.clone();
-                                let to = pending.to.clone();
-                                let filename = pending.filename.clone();
-                                let is_image = pending.is_image;
-                                let timestamp = pending.timestamp.clone();
-                                
-                                // Process as completed FileMessage
-                                let finalized_packet = crate::network::NetworkPacket::FileMessage {
-                                    from: from.clone(),
-                                    to: to.clone(),
-                                    filename: filename.clone(),
-                                    data: full_data.clone(),
-                                    is_image,
-                                    timestamp: timestamp.clone(),
-                                };
-                                
-                                // Manual re-dispatch to existing logic
-                                if let Some(target_dm) = to {
-                                    let other = if from == self.username { target_dm } else { from.clone() };
-                                    self.direct_messages.entry(other.clone()).or_default().push(ChatMessage {
-                                        username: from.clone(),
-                                        message: format!("Sent a file: {}", filename),
-                                        timestamp,
-                                        file_data: Some((filename, full_data, is_image)),
-                                    });
-                                } else {
-                                    self.chat_messages.push(ChatMessage {
-                                        username: from,
-                                        message: format!("Sent a file: {}", filename),
-                                        timestamp,
-                                        file_data: Some((filename, full_data, is_image)),
-                                    });
-                                }
-                                play_notification_beep();
-                                self.pending_files.remove(&id);
                             }
                         }
                     }
+                    crate::network::NetworkPacket::ChatHistory(history) => {
+                        self.chat_messages.clear();
+                        for p in history {
+                            match p {
+                                crate::network::NetworkPacket::ChatMessage { id, username, message, timestamp } => {
+                                    let decrypted_msg = crate::network::decrypt_bytes(&message)
+                                        .and_then(|b| String::from_utf8(b).ok())
+                                        .unwrap_or_else(|| "[Decryption Failed]".to_string());
+                                    self.chat_messages.push(ChatMessage {
+                                        id,
+                                        username,
+                                        message: decrypted_msg,
+                                        timestamp,
+                                        file_data: None,
+                                        reactions: HashMap::new(),
+                                    });
+                                }
+                                crate::network::NetworkPacket::FileMessage { id, from, to: _, filename, data, is_image, timestamp } => {
+                                    self.chat_messages.push(ChatMessage {
+                                        id,
+                                        username: from,
+                                        message: format!("Sent a file: {}", filename),
+                                        timestamp,
+                                        file_data: Some((filename, data, is_image)),
+                                        reactions: HashMap::new(),
+                                    });
+                                }
+                                crate::network::NetworkPacket::Reaction { msg_id, emoji, from } => {
+                                    for m in self.chat_messages.iter_mut() {
+                                        if m.id == msg_id {
+                                            m.reactions.entry(emoji.clone()).or_default().push(from.clone());
+                                            break;
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    crate::network::NetworkPacket::FileStart { id, from, to, filename, total_chunks, is_image, timestamp } => {
+                        self.pending_files.insert(id, PendingFile {
+                            filename, from, to, is_image, timestamp,
+                            chunks: vec![None; total_chunks],
+                            received_count: 0,
+                            total_chunks,
+                        });
+                    }
+                    crate::network::NetworkPacket::FileChunk { id, chunk_index, data } => {
+                        if let Some(pending) = self.pending_files.get_mut(&id) {
+                            if chunk_index < pending.total_chunks && pending.chunks[chunk_index].is_none() {
+                                pending.chunks[chunk_index] = Some(data);
+                                pending.received_count += 1;
+                                
+                                if pending.received_count == pending.total_chunks {
+                                    let mut full_data = Vec::new();
+                                    for chunk in pending.chunks.drain(..) {
+                                        if let Some(c) = chunk { full_data.extend(c); }
+                                    }
+                                    let from = pending.from.clone();
+                                    let to = pending.to.clone();
+                                    let filename = pending.filename.clone();
+                                    let is_image = pending.is_image;
+                                    let timestamp = pending.timestamp.clone();
+                                    
+                                    if let Some(target_dm) = to {
+                                        let other = if from == self.username { target_dm } else { from.clone() };
+                                        self.direct_messages.entry(other.clone()).or_default().push(ChatMessage {
+                                            id,
+                                            username: from,
+                                            message: format!("Sent a file: {}", filename),
+                                            timestamp,
+                                            file_data: Some((filename, full_data, is_image)),
+                                            reactions: HashMap::new(),
+                                        });
+                                    } else {
+                                        self.chat_messages.push(ChatMessage {
+                                            id,
+                                            username: from,
+                                            message: format!("Sent a file: {}", filename),
+                                            timestamp,
+                                            file_data: Some((filename, full_data, is_image)),
+                                            reactions: HashMap::new(),
+                                        });
+                                    }
+                                    play_notification_beep();
+                                    self.pending_files.remove(&id);
+                                }
+                            }
+                        }
+                    }
+                    crate::network::NetworkPacket::Reaction { msg_id, emoji, from } => {
+                        let mut found = false;
+                        for m in self.chat_messages.iter_mut() {
+                            if m.id == msg_id {
+                                m.reactions.entry(emoji.clone()).or_default().push(from.clone());
+                                found = true; break;
+                            }
+                        }
+                        if !found {
+                            for msgs in self.direct_messages.values_mut() {
+                                for m in msgs.iter_mut() {
+                                    if m.id == msg_id {
+                                        m.reactions.entry(emoji.clone()).or_default().push(from.clone());
+                                        found = true; break;
+                                    }
+                                }
+                                if found { break; }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1144,17 +1267,21 @@ impl eframe::App for SpeakVApp {
                                                 // Locally add to history
                                                 if let Some(target) = &self.selected_dm_target {
                                                     self.direct_messages.entry(target.clone()).or_default().push(ChatMessage {
+                                                        id,
                                                         username: "You".to_string(),
                                                         message: format!("Sent a file: {}", filename),
                                                         timestamp: timestamp.clone(),
                                                         file_data: Some((filename, data, is_image)),
+                                                        reactions: HashMap::new(),
                                                     });
                                                 } else {
                                                     self.chat_messages.push(ChatMessage {
+                                                        id,
                                                         username: "You".to_string(),
                                                         message: format!("Sent a file: {}", filename),
                                                         timestamp: timestamp.clone(),
                                                         file_data: Some((filename, data, is_image)),
+                                                        reactions: HashMap::new(),
                                                     });
                                                 }
                                             }
@@ -1176,37 +1303,44 @@ impl eframe::App for SpeakVApp {
                                 if (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) || send_clicked {
                                     if !self.chat_input.trim().is_empty() {
                                         let timestamp = chrono::Local::now().format("%H:%M").to_string();
-                                        let msg = ChatMessage {
-                                            username: self.username.clone(),
-                                            message: self.chat_input.clone(),
-                                            timestamp,
-                                            file_data: None,
-                                        };
+                                        let msg_id = uuid::Uuid::new_v4();
+                                        let msg_text = self.chat_input.clone();
                                         
-                                        let encrypted = crate::network::encrypt_bytes(msg.message.as_bytes());
+                                        let encrypted = crate::network::encrypt_bytes(msg_text.as_bytes());
                                         
                                         if let Some(target) = &self.selected_dm_target {
                                             let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::PrivateMessage {
+                                                id: msg_id,
                                                 from: self.username.clone(),
                                                 to: target.clone(),
                                                 message: encrypted,
-                                                timestamp: msg.timestamp.clone(),
+                                                timestamp: timestamp.clone(),
                                             });
                                             // Locally add to DM history
                                             self.direct_messages.entry(target.clone()).or_default().push(ChatMessage {
+                                                id: msg_id,
                                                 username: "You".to_string(),
-                                                message: self.chat_input.clone(),
-                                                timestamp: msg.timestamp.clone(),
+                                                message: msg_text,
+                                                timestamp,
                                                 file_data: None,
+                                                reactions: HashMap::new(),
                                             });
                                         } else {
                                             let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::ChatMessage {
-                                                username: msg.username.clone(),
+                                                id: msg_id,
+                                                username: self.username.clone(),
                                                 message: encrypted,
-                                                timestamp: msg.timestamp.clone(),
+                                                timestamp: timestamp.clone(),
                                             });
                                             // Locally add to chat history
-                                            self.chat_messages.push(msg);
+                                            self.chat_messages.push(ChatMessage {
+                                                id: msg_id,
+                                                username: "You".to_string(),
+                                                message: msg_text,
+                                                timestamp,
+                                                file_data: None,
+                                                reactions: HashMap::new(),
+                                            });
                                         }
 
                                         let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::TypingStatus {
@@ -1233,6 +1367,17 @@ impl eframe::App for SpeakVApp {
                             }
                             
                             ui.separator();
+
+                            // Search bar
+                            ui.horizontal(|ui| {
+                                ui.label("🔍");
+                                ui.text_edit_singleline(&mut self.search_query);
+                                if ui.button("Clear").clicked() {
+                                    self.search_query.clear();
+                                }
+                            });
+                            
+                            ui.separator();
                             
                             // Message history
                             egui::ScrollArea::vertical()
@@ -1247,6 +1392,10 @@ impl eframe::App for SpeakVApp {
                                         };
 
                                         for msg in messages {
+                                            if !self.search_query.is_empty() && !msg.message.to_lowercase().contains(&self.search_query.to_lowercase()) && !msg.username.to_lowercase().contains(&self.search_query.to_lowercase()) {
+                                                continue;
+                                            }
+                                            
                                             ui.horizontal_wrapped(|ui| {
                                                 ui.label(egui::RichText::new(&msg.timestamp)
                                                     .size(10.0)
@@ -1255,8 +1404,42 @@ impl eframe::App for SpeakVApp {
                                                     .strong()
                                                     .color(egui::Color32::from_rgb(100, 200, 255)));
                                             });
-                                            ui.label(&msg.message);
                                             
+                                            self.render_markdown_text(ui, &msg.message);
+                                            
+                                            // Reactions display
+                                            if !msg.reactions.is_empty() {
+                                                ui.horizontal_wrapped(|ui| {
+                                                    for (emoji, users) in &msg.reactions {
+                                                        let count = users.len();
+                                                        let tooltip = users.join(", ");
+                                                        if ui.button(format!("{} {}", emoji, count)).on_hover_text(tooltip).clicked() {
+                                                            let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::Reaction {
+                                                                msg_id: msg.id,
+                                                                emoji: emoji.clone(),
+                                                                from: self.username.clone(),
+                                                            });
+                                                        }
+                                                    }
+                                                });
+                                            }
+
+                                            // Add reaction button
+                                            ui.horizontal(|ui| {
+                                                ui.menu_button("➕", |ui| {
+                                                    for emoji in ["👍", "❤️", "😂", "😮", "😢", "🔥", "🚀"] {
+                                                        if ui.button(emoji).clicked() {
+                                                            let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::Reaction {
+                                                                msg_id: msg.id,
+                                                                emoji: emoji.to_string(),
+                                                                from: self.username.clone(),
+                                                            });
+                                                            ui.close_menu();
+                                                        }
+                                                    }
+                                                });
+                                            });
+
                                             // Render file attachment
                                             if let Some((filename, data, is_image)) = &msg.file_data {
                                                 if *is_image {
@@ -1451,8 +1634,20 @@ impl eframe::App for SpeakVApp {
                         .num_columns(2)
                         .spacing([40.0, 10.0])
                         .show(ui, |ui| {
+                            // Theme toggle
+                            ui.label("Theme:");
+                            ui.horizontal(|ui| {
+                                if ui.selectable_label(self.dark_mode, "🌙 Dark").clicked() {
+                                    self.dark_mode = true;
+                                }
+                                if ui.selectable_label(!self.dark_mode, "☀ Light").clicked() {
+                                    self.dark_mode = false;
+                                }
+                            });
+                            ui.end_row();
+
                             ui.label("Input Device:");
-                            egui::ComboBox::from_id_source("input_dev")
+                            egui::ComboBox::from_id_salt("input_dev")
                                 .selected_text(&self.selected_input_device)
                                 .show_ui(ui, |ui| {
                                     for device in &self.input_devices {
@@ -1462,7 +1657,7 @@ impl eframe::App for SpeakVApp {
                             ui.end_row();
 
                             ui.label("Output Device:");
-                            egui::ComboBox::from_id_source("output_dev")
+                            egui::ComboBox::from_id_salt("output_dev")
                                 .selected_text(&self.selected_output_device)
                                 .show_ui(ui, |ui| {
                                     for device in &self.output_devices {

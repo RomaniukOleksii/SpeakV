@@ -1,5 +1,5 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use ringbuf::{HeapRb, traits::{Consumer, Producer, Split, Observer}};
+use ringbuf::{HeapRb, traits::{Consumer, Producer, Split}};
 use std::sync::{Arc, Mutex};
 use anyhow::Result;
 
