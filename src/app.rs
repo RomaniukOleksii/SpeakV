@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 use std::sync::{Arc, Mutex};
 use std::fs;
+use serde::{Serialize, Deserialize};
 use rfd::FileDialog;
 use image;
 use rodio::Source;
@@ -60,6 +61,20 @@ enum ChatTab {
     Users,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub struct UserProfile {
+    pub username: String,
+    pub avatar_url: String,
+    pub bio: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AuthConfig {
+    username: String,
+    password_hash: String,
+    remember_me: bool,
+}
+
 pub struct SpeakVApp {
     audio_manager: Option<AudioManager>,
     network_manager: Option<NetworkManager>,
@@ -72,6 +87,7 @@ pub struct SpeakVApp {
     is_register_mode: bool,
     auth_message: String,
     login_input: String,
+    remember_me: bool,
 
     // Local User State
     is_muted: bool,
@@ -121,6 +137,13 @@ pub struct SpeakVApp {
     pending_files: HashMap<uuid::Uuid, PendingFile>,
     dark_mode: bool,
     search_query: String,
+    
+    // v0.9.0 Identity & Audio
+    remote_user_levels: Arc<Mutex<HashMap<String, f32>>>,
+    show_profile_card: Option<String>,
+    user_profiles: HashMap<String, UserProfile>,
+    avatar_url_input: String,
+    bio_input: String,
 }
 
 impl SpeakVApp {
@@ -141,9 +164,19 @@ impl SpeakVApp {
         let selected_input_device = input_devices.first().cloned().unwrap_or_default();
         let selected_output_device = output_devices.first().cloned().unwrap_or_default();
 
-        // Load Username
+        // Load Auth Config
         let mut username = String::new();
-        if let Ok(saved_name) = fs::read_to_string("user_config.txt") {
+        let mut password_input = String::new();
+        let mut remember_me = false;
+        
+        if let Ok(config_json) = fs::read_to_string("auth_config.json") {
+            if let Ok(config) = serde_json::from_str::<AuthConfig>(&config_json) {
+                username = config.username.clone();
+                password_input = config.password_hash.clone(); // In a real app, this should be a token or securely stored
+                remember_me = config.remember_me;
+            }
+        } else if let Ok(saved_name) = fs::read_to_string("user_config.txt") {
+            // Migration from old config
             let saved_name = saved_name.trim();
             if !saved_name.is_empty() {
                 username = saved_name.to_string();
@@ -151,13 +184,14 @@ impl SpeakVApp {
         }
 
         // Channels
-        let channels = Vec::new(); // Will be populated by server
+        let channels: Vec<Channel> = Vec::new(); // Will be populated by server
 
         let (outgoing_chat_tx, outgoing_chat_rx) = tokio::sync::mpsc::unbounded_channel();
         let (incoming_chat_tx, incoming_chat_rx) = tokio::sync::mpsc::unbounded_channel();
         let (speaking_users_tx, speaking_users_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let user_volumes = if let Some(net) = &network_manager { net.user_volumes.clone() } else { Arc::new(Mutex::new(HashMap::new())) };
+        let remote_user_levels = if let Some(net) = &network_manager { net.user_levels.clone() } else { Arc::new(Mutex::new(HashMap::new())) };
 
         let app = Self {
             audio_manager,
@@ -165,7 +199,8 @@ impl SpeakVApp {
             update_manager: UpdateManager::new(),
             username: username.clone(),
             login_input: username,
-            password_input: String::new(),
+            password_input,
+            remember_me,
             is_authenticated: false,
             is_register_mode: false,
             auth_message: String::new(),
@@ -195,7 +230,7 @@ impl SpeakVApp {
             chat_messages: Vec::new(),
             chat_input: String::new(),
             show_chat: true,
-            outgoing_chat_tx,
+            outgoing_chat_tx: outgoing_chat_tx.clone(),
             incoming_chat_rx,
             speaking_users_rx,
             participants: Vec::new(),
@@ -214,9 +249,16 @@ impl SpeakVApp {
             pending_files: HashMap::new(),
             dark_mode: true,
             search_query: String::new(),
+
+            // v0.9.0
+            remote_user_levels,
+            show_profile_card: None,
+            user_profiles: HashMap::new(),
+            avatar_url_input: String::new(),
+            bio_input: String::new(),
         };
 
-        // Auto-connect
+        // Auto-connect and auto-login if remember_me is true
         if let (Some(net), Some(audio)) = (&app.network_manager, &app.audio_manager) {
             let net_clone = net.clone();
             let input_cons = audio.input_consumer.clone();
@@ -224,6 +266,8 @@ impl SpeakVApp {
             let addr = app.server_address.clone();
             let outgoing_tx = app.outgoing_chat_tx.clone();
             let username_clone = app.username.clone();
+            let password_clone = app.password_input.clone();
+            let remember_me_clone = app.remember_me;
             let ctx_clone = cc.egui_ctx.clone();
             
             // Channel ends for network task
@@ -232,20 +276,50 @@ impl SpeakVApp {
             let network_speaking_tx = speaking_users_tx;
 
             tokio::spawn(async move {
-                net_clone.start(addr, input_cons, remote_prod, network_out_rx, network_in_tx, network_speaking_tx, ctx_clone, username_clone.clone());
+                let _ = net_clone.start(addr, input_cons, remote_prod, network_out_rx, network_in_tx, network_speaking_tx, ctx_clone, username_clone.clone());
 
                 // Send handshake
                 let _ = outgoing_tx.send(crate::network::NetworkPacket::Handshake { 
-                    username: username_clone 
+                    username: username_clone.clone() 
                 });
+
+                // Auto-login
+                if remember_me_clone && !username_clone.is_empty() && !password_clone.is_empty() {
+                    let _ = outgoing_tx.send(crate::network::NetworkPacket::Login {
+                        username: username_clone,
+                        password: password_clone,
+                    });
+                }
             });
         }
 
         app
     }
 
-    fn save_username(&self) {
-        let _ = fs::write("user_config.txt", &self.username);
+    fn save_auth_config(&self) {
+        let config = AuthConfig {
+            username: self.username.clone(),
+            password_hash: if self.remember_me { self.password_input.clone() } else { String::new() },
+            remember_me: self.remember_me,
+        };
+        if let Ok(config_json) = serde_json::to_string(&config) {
+            let _ = fs::write("auth_config.json", config_json);
+        }
+    }
+
+    fn logout(&mut self) {
+        self.is_authenticated = false;
+        self.username.clear();
+        self.login_input.clear();
+        self.password_input.clear();
+        self.remember_me = false;
+        self.chat_messages.clear();
+        self.direct_messages.clear();
+        self.channels.clear();
+        self.save_auth_config();
+        
+        // Also remove legacy config
+        let _ = fs::remove_file("user_config.txt");
     }
 
     fn render_update_section(&mut self, ui: &mut egui::Ui) {
@@ -392,6 +466,34 @@ fn hex_to_color(hex: &str) -> Result<egui::Color32, ()> {
     Ok(egui::Color32::from_rgb(r, g, b))
 }
 
+fn render_waveform(ui: &mut egui::Ui, level: f32, color: egui::Color32) {
+    let count = 5;
+    let spacing = 2.0;
+    let width = 2.0;
+    let max_height = 10.0;
+    
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(count as f32 * (width + spacing), max_height),
+        egui::Sense::hover()
+    );
+    
+    let time = ui.input(|i| i.time);
+    
+    for i in 0..count {
+        let phase = i as f64 * 0.5 + time * 10.0;
+        let anim = (phase.sin() as f32 + 1.0) * 0.5;
+        let h = (level * max_height * anim).max(1.0);
+        let x = rect.left() + i as f32 * (width + spacing);
+        let y = rect.center().y - h / 2.0;
+        
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(width, h)),
+            2.0,
+            color
+        );
+    }
+}
+
 impl eframe::App for SpeakVApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.dark_mode {
@@ -431,7 +533,7 @@ impl eframe::App for SpeakVApp {
                             if let Some(r) = role { self.role = r; }
                             if let Some(s) = status { self.status_input = s; }
                             if let Some(c) = nick_color { self.nick_color_input = c; }
-                            self.save_username();
+                            self.save_auth_config();
                         }
                     }
                     crate::network::NetworkPacket::UsersUpdate(chan_state) => {
@@ -492,6 +594,13 @@ impl eframe::App for SpeakVApp {
                         } else {
                             self.typing_users.remove(&username);
                         }
+                    }
+                    crate::network::NetworkPacket::ProfileUpdate { username, avatar_url, bio } => {
+                        self.user_profiles.insert(username.clone(), UserProfile {
+                            username,
+                            avatar_url,
+                            bio,
+                        });
                     }
                     crate::network::NetworkPacket::PrivateMessage { id, from, to, message, timestamp } => {
                         let decrypted_msg = crate::network::decrypt_bytes(&message)
@@ -730,7 +839,6 @@ impl eframe::App for SpeakVApp {
                         if !self.auth_message.is_empty() {
                             let color = if self.is_authenticated { egui::Color32::GREEN } else { egui::Color32::LIGHT_RED };
                             ui.label(egui::RichText::new(&self.auth_message).color(color));
-                            ui.add_space(10.0);
                         }
 
                         ui.horizontal(|ui| {
@@ -785,6 +893,9 @@ impl eframe::App for SpeakVApp {
                                     let _ = self.outgoing_chat_tx.send(packet);
                                 }
                             }
+                            
+                            ui.checkbox(&mut self.remember_me, "Remember Me");
+                            ui.add_space(5.0);
 
                             if ui.button(if self.is_register_mode { "Switch to Login" } else { "Switch to Register" }).clicked() {
                                 self.is_register_mode = !self.is_register_mode;
@@ -1000,6 +1111,16 @@ impl eframe::App for SpeakVApp {
                                             }
                                         }
 
+                                        let level = {
+                                            let levels = self.remote_user_levels.lock().unwrap();
+                                            *levels.get(&user.name).unwrap_or(&0.0)
+                                        };
+
+                                        if level > 0.01 {
+                                            render_waveform(ui, level.min(1.0), egui::Color32::from_rgb(0, 255, 128));
+                                            ui.add_space(4.0);
+                                        }
+
                                         let display_name = if is_me { format!("{} (You)", user.name) } else { user.name.clone() };
                                         let mut label = egui::RichText::new(format!("{} {}", icon, display_name)).color(color);
                                         
@@ -1010,13 +1131,13 @@ impl eframe::App for SpeakVApp {
 
                                         if user.role == "Admin" {
                                             label = label.strong();
-                                            if user.role == "Admin" {
-                                                // Golden for Admin name if no custom color?
-                                                // Let's just make it bold and show the color.
-                                            }
                                         }
 
-                                        let resp = ui.label(label);
+                                        let resp = ui.add(egui::Button::new(label).frame(false)).on_hover_text("Click to view profile");
+                                        if resp.clicked() {
+                                            self.show_profile_card = Some(user.name.clone());
+                                            let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::RequestProfile(user.name.clone()));
+                                        }
                                         if !user.status.is_empty() {
                                             ui.label(egui::RichText::new(format!("({})", user.status)).size(10.0).color(egui::Color32::GRAY));
                                         }
@@ -1147,10 +1268,24 @@ impl eframe::App for SpeakVApp {
                                         let (rect, _resp) = ui.allocate_at_least(egui::vec2(10.0, 10.0), egui::Sense::hover());
                                         ui.painter().circle_filled(rect.center(), 5.0, badge_color);
                                         
+                                        let level = {
+                                            let levels = self.remote_user_levels.lock().unwrap();
+                                            *levels.get(user).unwrap_or(&0.0)
+                                        };
+
+                                        if level > 0.01 {
+                                            render_waveform(ui, level.min(1.0), egui::Color32::from_rgb(0, 255, 128));
+                                            ui.add_space(4.0);
+                                        }
+
                                         let label = egui::RichText::new(user)
                                             .color(egui::Color32::WHITE);
                                         
-                                        let resp = ui.label(label);
+                                        let resp = ui.add(egui::Button::new(label).frame(false)).on_hover_text("Click to view profile");
+                                        if resp.clicked() {
+                                            self.show_profile_card = Some(user.clone());
+                                            let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::RequestProfile(user.clone()));
+                                        }
                                         
                                         // Context menu for volume and admin
                                         resp.context_menu(|ui| {
@@ -1666,6 +1801,18 @@ impl eframe::App for SpeakVApp {
                                 });
                             ui.end_row();
                             
+                            ui.end_row();
+
+                            ui.label("Levels:");
+                            ui.horizontal(|ui| {
+                                let vol = if let Some(audio) = &self.audio_manager {
+                                    *audio.current_volume.lock().unwrap()
+                                } else { 0.0 };
+                                ui.add(egui::ProgressBar::new(vol.min(1.0)).show_percentage());
+                                ui.label(egui::RichText::new("Mic Level").small());
+                            });
+                            ui.end_row();
+                            
                             ui.label("Input Mode:");
                             ui.horizontal(|ui| {
                                 let prev_mode = self.input_mode == InputMode::VoiceActivity;
@@ -1689,6 +1836,27 @@ impl eframe::App for SpeakVApp {
                                 ui.add(egui::Slider::new(&mut self.vad_threshold, 0.0..=1.0).text("Volume"));
                                 ui.end_row();
                             }
+
+                            ui.separator();
+                            ui.end_row();
+                            
+                            ui.label("Profile Avatar:");
+                            ui.add(egui::TextEdit::singleline(&mut self.avatar_url_input).hint_text("https://..."));
+                            ui.end_row();
+                            
+                            ui.label("Profile Bio:");
+                            ui.add(egui::TextEdit::multiline(&mut self.bio_input).hint_text("Tell us about yourself..."));
+                            ui.end_row();
+                            
+                            ui.label("");
+                            if ui.button("💾 Update Profile").clicked() {
+                                let _ = self.outgoing_chat_tx.send(crate::network::NetworkPacket::ProfileUpdate {
+                                    username: self.username.clone(),
+                                    avatar_url: self.avatar_url_input.clone(),
+                                    bio: self.bio_input.clone(),
+                                });
+                            }
+                            ui.end_row();
 
                             ui.label("Self Listen:");
                             if ui.checkbox(&mut self.self_listen, "Listen to self").changed() {
@@ -1745,6 +1913,13 @@ impl eframe::App for SpeakVApp {
                         if ui.button("Close").clicked() {
                             self.show_settings = false;
                         }
+                        
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button(egui::RichText::new("🚪 Logout").color(egui::Color32::LIGHT_RED)).clicked() {
+                                self.logout();
+                                self.show_settings = false;
+                            }
+                        });
                     });
                 });
         }
@@ -1773,6 +1948,51 @@ impl eframe::App for SpeakVApp {
                             self.show_create_channel_dialog = false;
                         }
                     });
+                });
+        }
+
+        // --- Profile Card ---
+        if let Some(profile_username) = self.show_profile_card.clone() {
+            egui::Window::new(format!("👤 Profile: {}", profile_username))
+                .collapsible(false)
+                .resizable(true)
+                .default_width(320.0)
+                .show(ctx, |ui| {
+                    if let Some(profile) = self.user_profiles.get(&profile_username) {
+                        ui.vertical_centered(|ui| {
+                            if !profile.avatar_url.is_empty() {
+                                ui.group(|ui| {
+                                    ui.label(egui::RichText::new("🖼 Avatar Link:").small().color(egui::Color32::GRAY));
+                                    ui.hyperlink(&profile.avatar_url);
+                                });
+                                ui.add_space(8.0);
+                            }
+                            
+                            ui.heading(egui::RichText::new(&profile.username).color(egui::Color32::WHITE));
+                            ui.add_space(4.0);
+                            
+                            ui.separator();
+                            ui.add_space(8.0);
+                            
+                            ui.label(egui::RichText::new("Biography").strong());
+                            ui.add_space(4.0);
+                            
+                            egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                                ui.label(&profile.bio);
+                            });
+                        });
+                    } else {
+                        ui.centered_and_justified(|ui| {
+                            ui.spinner();
+                            ui.label("Fetching profile...");
+                        });
+                    }
+                    
+                    ui.add_space(16.0);
+                    ui.separator();
+                    if ui.button("Close").clicked() {
+                        self.show_profile_card = None;
+                    }
                 });
         }
 

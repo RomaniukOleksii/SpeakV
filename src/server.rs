@@ -62,8 +62,9 @@ pub async fn run_server() -> anyhow::Result<()> {
             password_hash TEXT NOT NULL,
             role TEXT DEFAULT 'User',
             is_banned INTEGER DEFAULT 0,
-            status TEXT DEFAULT '',
-            nick_color TEXT DEFAULT '#FFFFFF'
+            nick_color TEXT DEFAULT '#FFFFFF',
+            avatar_url TEXT DEFAULT '',
+            bio TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS chat_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,12 +110,15 @@ pub async fn run_server() -> anyhow::Result<()> {
 
     let mut initial_channels = std::collections::HashSet::new();
     {
-        let db_lock = db.lock().unwrap();
-        let mut stmt = db_lock.prepare("SELECT name FROM channels").unwrap();
-        let chan_rows = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
-        for chan in chan_rows {
-            if let Ok(c) = chan {
-                initial_channels.insert(c);
+        if let Ok(db_lock) = db.lock() {
+            if let Ok(mut stmt) = db_lock.prepare("SELECT name FROM channels") {
+                if let Ok(chan_rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+                    for chan in chan_rows {
+                        if let Ok(c) = chan {
+                            initial_channels.insert(c);
+                        }
+                    }
+                }
             }
         }
     }
@@ -180,11 +184,11 @@ pub async fn run_server() -> anyhow::Result<()> {
                     }
                 }
                 crate::network::NetworkPacket::Login { username, password } => {
-                    let result: Result<(String, String, bool, String, String), _> = {
-                        let db_lock = db.lock().unwrap();
-                        let mut stmt = db_lock.prepare("SELECT password_hash, role, is_banned, status, nick_color FROM users WHERE username = ?1").unwrap();
+                    let result: Result<(String, String, bool, String, String), _> = (|| {
+                        let db_lock = db.lock().map_err(|_| rusqlite::Error::ExecuteReturnedResults)?;
+                        let mut stmt = db_lock.prepare("SELECT password_hash, role, is_banned, status, nick_color FROM users WHERE username = ?1")?;
                         stmt.query_row(params![username], |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i32>(2)? != 0, row.get(3)?, row.get(4)?)))
-                    };
+                    })();
 
                     let (success, msg, role, status, color) = match result {
                         Ok((stored_hash, role, is_banned, status, color)) => {
@@ -334,62 +338,66 @@ pub async fn run_server() -> anyhow::Result<()> {
                 crate::network::NetworkPacket::RequestChatHistory { channel } => {
                     if let Some(info) = clients_guard.get(&addr) {
                         if info.is_authenticated {
-                            let history: Vec<crate::network::NetworkPacket> = {
+                            let history_result: Result<Vec<crate::network::NetworkPacket>, rusqlite::Error> = (|| {
                                 let db_lock = db.lock().unwrap();
-                                let mut stmt = db_lock.prepare(
+                                let mut final_history = Vec::new();
+
+                                // Fetch chat messages
+                                if let Ok(mut stmt) = db_lock.prepare(
                                     "SELECT msg_id, username, message, timestamp FROM chat_messages 
                                      WHERE channel = ?1 ORDER BY id DESC LIMIT 50"
-                                ).unwrap();
+                                ) {
+                                    if let Ok(rows) = stmt.query_map(params![channel], |row| {
+                                        let msg_id_str: String = row.get(0)?;
+                                        Ok(crate::network::NetworkPacket::ChatMessage {
+                                            id: uuid::Uuid::parse_str(&msg_id_str).unwrap_or_default(),
+                                            username: row.get(1)?,
+                                            message: row.get::<_, Vec<u8>>(2)?,
+                                            timestamp: row.get(3)?,
+                                        })
+                                    }) {
+                                        for r in rows { if let Ok(p) = r { final_history.push(p); } }
+                                    }
+                                }
                                 
-                                let rows = stmt.query_map(params![channel], |row| {
-                                    let msg_id_str: String = row.get(0)?;
-                                    Ok(crate::network::NetworkPacket::ChatMessage {
-                                        id: uuid::Uuid::parse_str(&msg_id_str).unwrap_or_default(),
-                                        username: row.get(1)?,
-                                        message: row.get::<_, Vec<u8>>(2)?,
-                                        timestamp: row.get(3)?,
-                                    })
-                                }).unwrap();
-                                
-                                let mut final_history = Vec::new();
-                                for r in rows { if let Ok(p) = r { final_history.push(p); } }
-
-                                // Fetch file messages for this channel
-                                let mut stmt_files = db_lock.prepare(
+                                // Fetch file messages
+                                if let Ok(mut stmt_files) = db_lock.prepare(
                                     "SELECT msg_id, username, filename, data, is_image, timestamp FROM file_messages 
                                      WHERE channel = ?1 AND recipient IS NULL ORDER BY id DESC LIMIT 50"
-                                ).unwrap();
-                                let file_rows = stmt_files.query_map(params![channel], |row| {
-                                    let msg_id_str: String = row.get(0)?;
-                                    Ok(crate::network::NetworkPacket::FileMessage {
-                                        id: uuid::Uuid::parse_str(&msg_id_str).unwrap_or_default(),
-                                        from: row.get(1)?,
-                                        to: None,
-                                        filename: row.get(2)?,
-                                        data: row.get::<_, Vec<u8>>(3)?,
-                                        is_image: row.get::<_, i32>(4)? == 1,
-                                        timestamp: row.get(5)?,
-                                    })
-                                }).unwrap();
-                                for r in file_rows { if let Ok(p) = r { final_history.push(p); } }
+                                ) {
+                                    if let Ok(file_rows) = stmt_files.query_map(params![channel], |row| {
+                                        let msg_id_str: String = row.get(0)?;
+                                        Ok(crate::network::NetworkPacket::FileMessage {
+                                            id: uuid::Uuid::parse_str(&msg_id_str).unwrap_or_default(),
+                                            from: row.get(1)?,
+                                            to: None,
+                                            filename: row.get(2)?,
+                                            data: row.get::<_, Vec<u8>>(3)?,
+                                            is_image: row.get::<_, i32>(4)? == 1,
+                                            timestamp: row.get(5)?,
+                                        })
+                                    }) {
+                                        for r in file_rows { if let Ok(p) = r { final_history.push(p); } }
+                                    }
+                                }
                                 
-                                // Fetch reactions and add them as separate packets or attach to messages?
-                                // Protocol wise, maybe it's better to add a ReactionsHistory variant?
-                                // Actually, let's just append all relevant reactions to the history too.
-                                let mut stmt_react = db_lock.prepare(
+                                // Fetch reactions
+                                if let Ok(mut stmt_react) = db_lock.prepare(
                                     "SELECT msg_id, username, emoji FROM reactions 
                                      WHERE msg_id IN (SELECT msg_id FROM chat_messages WHERE channel = ?1)
                                      OR msg_id IN (SELECT msg_id FROM file_messages WHERE channel = ?1)"
-                                ).unwrap();
-                                let react_rows = stmt_react.query_map(params![channel], |row| {
-                                    let msg_id_str: String = row.get(0)?;
-                                    Ok(crate::network::NetworkPacket::Reaction {
-                                        msg_id: uuid::Uuid::parse_str(&msg_id_str).unwrap_or_default(),
-                                        from: row.get(1)?,
-                                        emoji: row.get(2)?,
-                                    })
-                                }).unwrap();
-                                for r in react_rows { if let Ok(p) = r { final_history.push(p); } }
+                                ) {
+                                    if let Ok(react_rows) = stmt_react.query_map(params![channel], |row| {
+                                        let msg_id_str: String = row.get(0)?;
+                                        Ok(crate::network::NetworkPacket::Reaction {
+                                            msg_id: uuid::Uuid::parse_str(&msg_id_str).unwrap_or_default(),
+                                            from: row.get(1)?,
+                                            emoji: row.get(2)?,
+                                        })
+                                    }) {
+                                        for r in react_rows { if let Ok(p) = r { final_history.push(p); } }
+                                    }
+                                }
 
                                 // Sort combined by timestamp
                                 final_history.sort_by(|a, b| {
@@ -401,12 +409,22 @@ pub async fn run_server() -> anyhow::Result<()> {
                                     get_ts(a).cmp(&get_ts(b))
                                 });
                                 
-                                final_history
-                            };
+                                Ok(final_history)
+                            })();
                             
-                            let packet = crate::network::NetworkPacket::ChatHistory(history);
-                            let encoded = bincode::serialize(&packet).unwrap();
-                            let _ = socket.send_to(&encoded, addr).await;
+                            match history_result {
+                                Ok(history) => {
+                                    let packet = crate::network::NetworkPacket::ChatHistory(history);
+                                    if let Ok(encoded) = bincode::serialize(&packet) {
+                                        let _ = socket.send_to(&encoded, addr).await;
+                                    }
+                                },
+                                Err(e) => {
+                                    eprintln!("DB Error fetching history for channel '{}': {}", channel, e);
+                                    // Send partial/empty history or error packet? 
+                                    // For now, just logging is better than crashing.
+                                }
+                            }
                         }
                     }
                 }
@@ -467,63 +485,69 @@ pub async fn run_server() -> anyhow::Result<()> {
                     if let Some(info) = clients_guard.get(&addr) {
                         if info.is_authenticated {
                             let me = info.username.clone();
-                            let history: Vec<crate::network::NetworkPacket> = {
+                            let history_result: Result<Vec<crate::network::NetworkPacket>, rusqlite::Error> = (|| {
                                 let db_lock = db.lock().unwrap();
-                                let mut stmt = db_lock.prepare(
+                                let mut final_history = Vec::new();
+
+                                // Fetch private messages
+                                if let Ok(mut stmt) = db_lock.prepare(
                                     "SELECT msg_id, sender, recipient, message, timestamp FROM private_messages 
                                      WHERE (sender = ?1 AND recipient = ?2) OR (sender = ?2 AND recipient = ?1)
                                      ORDER BY id DESC LIMIT 50"
-                                ).unwrap();
-                                
-                                let rows = stmt.query_map(params![me, target], |row| {
-                                    let msg_id_str: String = row.get(0)?;
-                                    Ok(crate::network::NetworkPacket::PrivateMessage {
-                                        id: uuid::Uuid::parse_str(&msg_id_str).unwrap_or_default(),
-                                        from: row.get(1)?,
-                                        to: row.get(2)?,
-                                        message: row.get::<_, Vec<u8>>(3)?,
-                                        timestamp: row.get(4)?,
-                                    })
-                                }).unwrap();
-                                
-                                let mut final_history = Vec::new();
-                                for r in rows { if let Ok(p) = r { final_history.push(p); } }
+                                ) {
+                                    if let Ok(rows) = stmt.query_map(params![me, target], |row| {
+                                        let msg_id_str: String = row.get(0)?;
+                                        Ok(crate::network::NetworkPacket::PrivateMessage {
+                                            id: uuid::Uuid::parse_str(&msg_id_str).unwrap_or_default(),
+                                            from: row.get(1)?,
+                                            to: row.get(2)?,
+                                            message: row.get::<_, Vec<u8>>(3)?,
+                                            timestamp: row.get(4)?,
+                                        })
+                                    }) {
+                                        for r in rows { if let Ok(p) = r { final_history.push(p); } }
+                                    }
+                                }
 
                                 // Fetch file messages for this DM
-                                let mut stmt_files = db_lock.prepare(
+                                if let Ok(mut stmt_files) = db_lock.prepare(
                                     "SELECT msg_id, username, recipient, filename, data, is_image, timestamp FROM file_messages 
                                      WHERE (username = ?1 AND recipient = ?2) OR (username = ?2 AND recipient = ?1)
                                      ORDER BY id DESC LIMIT 50"
-                                ).unwrap();
-                                let file_rows = stmt_files.query_map(params![me, target], |row| {
-                                    let msg_id_str: String = row.get(0)?;
-                                    Ok(crate::network::NetworkPacket::FileMessage {
-                                        id: uuid::Uuid::parse_str(&msg_id_str).unwrap_or_default(),
-                                        from: row.get(1)?,
-                                        to: Some(row.get(2)?),
-                                        filename: row.get(3)?,
-                                        data: row.get::<_, Vec<u8>>(4)?,
-                                        is_image: row.get::<_, i32>(5)? == 1,
-                                        timestamp: row.get(6)?,
-                                    })
-                                }).unwrap();
-                                for r in file_rows { if let Ok(p) = r { final_history.push(p); } }
+                                ) {
+                                    if let Ok(file_rows) = stmt_files.query_map(params![me, target], |row| {
+                                        let msg_id_str: String = row.get(0)?;
+                                        Ok(crate::network::NetworkPacket::FileMessage {
+                                            id: uuid::Uuid::parse_str(&msg_id_str).unwrap_or_default(),
+                                            from: row.get(1)?,
+                                            to: Some(row.get(2)?),
+                                            filename: row.get(3)?,
+                                            data: row.get::<_, Vec<u8>>(4)?,
+                                            is_image: row.get::<_, i32>(5)? == 1,
+                                            timestamp: row.get(6)?,
+                                        })
+                                    }) {
+                                        for r in file_rows { if let Ok(p) = r { final_history.push(p); } }
+                                    }
+                                }
 
                                 // Fetch reactions for DM
-                                let mut stmt_react = db_lock.prepare(
+                                if let Ok(mut stmt_react) = db_lock.prepare(
                                     "SELECT msg_id, username, emoji FROM reactions 
                                      WHERE msg_id IN (SELECT msg_id FROM private_messages WHERE (sender = ?1 AND recipient = ?2) OR (sender = ?2 AND recipient = ?1))
                                      OR msg_id IN (SELECT msg_id FROM file_messages WHERE (username = ?1 AND recipient = ?2) OR (username = ?2 AND recipient = ?1))"
-                                ).unwrap();
-                                let react_rows = stmt_react.query_map(params![me, target], |row| {
-                                    let msg_id_str: String = row.get(0)?;
-                                    Ok(crate::network::NetworkPacket::Reaction {
-                                        msg_id: uuid::Uuid::parse_str(&msg_id_str).unwrap_or_default(),
-                                        from: row.get(1)?,
-                                        emoji: row.get(2)?,
-                                    })
-                                }).unwrap();
-                                for r in react_rows { if let Ok(p) = r { final_history.push(p); } }
+                                ) {
+                                    if let Ok(react_rows) = stmt_react.query_map(params![me, target], |row| {
+                                        let msg_id_str: String = row.get(0)?;
+                                        Ok(crate::network::NetworkPacket::Reaction {
+                                            msg_id: uuid::Uuid::parse_str(&msg_id_str).unwrap_or_default(),
+                                            from: row.get(1)?,
+                                            emoji: row.get(2)?,
+                                        })
+                                    }) {
+                                        for r in react_rows { if let Ok(p) = r { final_history.push(p); } }
+                                    }
+                                }
                                 
                                 final_history.sort_by(|a, b| {
                                     let get_ts = |p: &crate::network::NetworkPacket| match p {
@@ -535,12 +559,20 @@ pub async fn run_server() -> anyhow::Result<()> {
                                     get_ts(a).cmp(&get_ts(b))
                                 });
                                 
-                                final_history
-                            };
-                            
-                            let response = crate::network::NetworkPacket::DirectHistory(history);
-                            let encoded = bincode::serialize(&response).unwrap();
-                            let _ = socket.send_to(&encoded, addr).await;
+                                Ok(final_history)
+                            })();
+
+                            match history_result {
+                                Ok(history) => {
+                                    let response = crate::network::NetworkPacket::DirectHistory(history);
+                                    if let Ok(encoded) = bincode::serialize(&response) {
+                                        let _ = socket.send_to(&encoded, addr).await;
+                                    }
+                                },
+                                Err(e) => {
+                                    eprintln!("DB Error fetching DM history for '{}' and '{}': {}", me, target, e);
+                                }
+                            }
                         }
                     }
                 }
@@ -649,6 +681,57 @@ pub async fn run_server() -> anyhow::Result<()> {
                             // Broadcast to all relevant clients
                             for &client_addr in clients_guard.keys() {
                                 let _ = socket.send_to(&buf[..len], client_addr).await;
+                            }
+                        }
+                    }
+                }
+                crate::network::NetworkPacket::RequestProfile(target_user) => {
+                    let mut avatar_url = String::new();
+                    let mut bio = String::new();
+                    
+                    let db_lock = db.lock().unwrap();
+                    let _ = db_lock.query_row(
+                        "SELECT avatar_url, bio FROM users WHERE username = ?",
+                        [target_user.clone()],
+                        |row| {
+                            avatar_url = row.get(0)?;
+                            bio = row.get(1)?;
+                            Ok(())
+                        }
+                    );
+                    
+                    let response = crate::network::NetworkPacket::ProfileUpdate {
+                        username: target_user.to_string(),
+                        avatar_url,
+                        bio,
+                    };
+                    if let Ok(encoded) = bincode::serialize(&response) {
+                        let _ = socket.send_to(&encoded, addr).await;
+                    }
+                }
+                crate::network::NetworkPacket::ProfileUpdate { username: _, avatar_url, bio } => {
+                    if let Some(info) = clients_guard.get(&addr) {
+                        if info.is_authenticated {
+                            let username = info.username.clone();
+                            // Update in DB
+                            {
+                                let db_lock = db.lock().unwrap();
+                                let _ = db_lock.execute(
+                                    "UPDATE users SET avatar_url = ?, bio = ? WHERE username = ?",
+                                    [avatar_url.clone(), bio.clone(), username.clone()],
+                                );
+                            }
+                            
+                            // Broadcast to all
+                            let update = crate::network::NetworkPacket::ProfileUpdate {
+                                username,
+                                avatar_url: avatar_url.clone(),
+                                bio: bio.clone(),
+                            };
+                            if let Ok(encoded) = bincode::serialize(&update) {
+                                for &client_addr in clients_guard.keys() {
+                                    let _ = socket.send_to(&encoded, client_addr).await;
+                                }
                             }
                         }
                     }

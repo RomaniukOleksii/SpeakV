@@ -54,6 +54,12 @@ pub enum NetworkPacket {
     FileStart { id: uuid::Uuid, from: String, to: Option<String>, filename: String, total_chunks: usize, is_image: bool, timestamp: String },
     FileChunk { id: uuid::Uuid, chunk_index: usize, data: Vec<u8> },
     Reaction { msg_id: uuid::Uuid, emoji: String, from: String },
+    RequestProfile(String), // username
+    ProfileUpdate {
+        username: String,
+        avatar_url: String,
+        bio: String,
+    },
 }
 
 // Re-add imports needed for the rest of the file
@@ -91,6 +97,7 @@ pub struct NetworkManager {
     pub can_transmit: Arc<Mutex<bool>>,
     runtime: tokio::runtime::Handle,
     pub user_volumes: Arc<Mutex<std::collections::HashMap<String, f32>>>,
+    pub user_levels: Arc<Mutex<std::collections::HashMap<String, f32>>>,
 }
 
 impl NetworkManager {
@@ -101,6 +108,7 @@ impl NetworkManager {
             can_transmit: Arc::new(Mutex::new(false)),
             runtime: tokio::runtime::Handle::current(),
             user_volumes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            user_levels: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -119,6 +127,7 @@ impl NetworkManager {
         let is_connected = self.is_connected.clone();
         let can_transmit = self.can_transmit.clone();
         let user_volumes = self.user_volumes.clone();
+        let user_levels = self.user_levels.clone();
         let speaking_tx = speaking_users_tx;
         
         self.runtime.spawn(async move {
@@ -241,6 +250,17 @@ impl NetworkManager {
                                                     for x in &mut decrypted_data {
                                                         *x *= volume;
                                                     }
+                                                }
+
+                                                // Calculate level for visualizers
+                                                let mut sum_sq = 0.0;
+                                                for &sample in &decrypted_data {
+                                                    sum_sq += sample * sample;
+                                                }
+                                                let rms = (sum_sq / decrypted_data.len() as f32).sqrt();
+                                                {
+                                                    let mut levels = user_levels.lock().unwrap();
+                                                    levels.insert(username.clone(), rms);
                                                 }
 
                                                 let mut prod = remote_producer.lock().unwrap();
